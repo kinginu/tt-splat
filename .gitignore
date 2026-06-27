@@ -1,0 +1,54 @@
+# build
+build/
+*.o
+*.so
+*.a
+CMakeCache.txt
+CMakeFiles/
+compile_commands.json
+.cache/
+ccache/
+
+# python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# data & models (large — use LFS or external storage)
+*.ply
+*.splat
+data/
+datasets/
+checkpoints/
+*.pt
+*.pth
+*.ckpt
+
+# outputs: ignore heavy artifacts (.ply via the rule above, .png renders, .log) BUT commit the
+# small machine-readable eval cards + json roll-ups — they ARE the shared NV/BH comparison record
+# (so it/s, PSNR, card channels live in git, not hand-transcribed into docs).
+outputs/**
+!outputs/**/
+!outputs/**/*.eval.json
+!outputs/**/*.json
+outputs/_smoke*/
+
+# tt-metal generated / logs
+generated/
+*.log
+
+# editor / os
+.vscode/*
+!.vscode/extensions.json
+.idea/
+.zed/
+.DS_Store
+
+# editor / agent tooling
+.claude/
+
+.private-docs/

@@ -1,0 +1,16 @@
+{
+  "scene": "playroom",
+  "res": "1264x832",
+  "trainer": "m6_resident_traced --multi-view --device-binning (Blackhole p150a)",
+  "note": "MULTI-VIEW training: 196 train / 29 held-out test views (every-8th). Device forward binning (topk-per-tile) + host grad-scatter + host loss. Matrix-native 3DGS math (poly-splat + weighted-sum blend) -> .ply is fit to OUR renderer; standard 3DGS viewers won't reproduce it.",
+  "G": 100000,
+  "iters": 6000,
+  "ms_per_it": 1125.1,
+  "wall_hours": 1.9,
+  "held_out_psnr_db": 17.37,
+  "train_psnr_db": 17.08,
+  "generalizes": "test ~= train (17.37 vs 17.08) -> genuine multi-view 3D reconstruction, not single-view overfit",
+  "ply": "outputs/bench/playroom_G100k_mv.ply (100000 gaussians, 6.8 MB, gitignored)",
+  "context_vs_standard_3dgs": "standard 3DGS playroom ~30 dB (1-3M gaussians, 30k iters); matrix-native 17.4 dB at 100k/6000 = the documented weighted-sum-blend ceiling + fewer gaussians/iters",
+  "G300k": "NOT achievable on device binning: forward dense [T,G]=4.93GB OOMs (32GB card + fragmentation), even with dealloc/multi-view. Needs host binning or chunked-topk rewrite."
+}

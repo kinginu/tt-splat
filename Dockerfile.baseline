@@ -1,0 +1,28 @@
+# Standard 3DGS baseline (gsplat, nerfstudio-project) — the comparison ORACLE for matrix-native 3DGS.
+# Held-out PSNR from this standard sorted-alpha renderer is what the matrix-native arms
+# (poly-splat + WSR) are measured against.
+#
+# Built to match the VALIDATED native recipe: python 3.10 + torch 2.4.1+cu121 + the gsplat prebuilt
+# wheel — whose CUDA backend `_C` loads on py3.10 with NO nvcc. (The pytorch/pytorch -runtime base is
+# conda py3.11, where that wheel's `_C` won't load; the -devel base would fix it but is ~9 GB. This
+# slim base is smaller AND is exactly what was verified on the 3090, so the renderer is de-risked.)
+# torch/CUDA still match the cuda service (2.4.1 / cu121) — only the renderer math differs.
+FROM python:3.10-slim
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      git curl ca-certificates && rm -rf /var/lib/apt/lists/*
+
+# torch first (CUDA build), then the gsplat wheel for this exact torch/cuda (pt24cu121).
+RUN pip install --no-cache-dir torch==2.4.1 --index-url https://download.pytorch.org/whl/cu121
+ARG GSPLAT_VERSION=1.5.3
+RUN pip install --no-cache-dir "gsplat==${GSPLAT_VERSION}" \
+      --index-url https://docs.gsplat.studio/whl/pt24cu121 \
+      --extra-index-url https://pypi.org/simple
+
+# The baseline shares the spike data/metric path for an apples-to-apples comparison.
+RUN pip install --no-cache-dir numpy pillow pytorch-msssim==1.0.0 pytest==8.3.3 tqdm
+
+ENV PYTHONUNBUFFERED=1
+WORKDIR /workspace
+CMD ["/bin/bash"]

@@ -1,0 +1,18 @@
+{
+  "scene": "playroom",
+  "res": "1264x832",
+  "comparison": "matrix-native 3DGS @ Blackhole p150a (device-resident: device-binning+scatter+loss, traced) vs standard 3DGS @ RTX 3090",
+  "note": "BH matrix-native is SRAM-resident-scale; G capped at <=10k here (dense topk binning hangs at large width + full-res render cost). 3090 standard CUDA scales to 3M. render_fps for BH is binned O(P*K) -> G-INDEPENDENT.",
+  "blackhole_matrix_native": [
+    {"G": 2000,  "it_per_s": 3.45, "ms_per_it": 289.7, "render_fps": 14.6, "binning_pct": 6},
+    {"G": 5000,  "it_per_s": 2.82, "ms_per_it": 354.3, "render_fps": 14.6, "binning_pct": 12},
+    {"G": 10000, "it_per_s": 2.13, "ms_per_it": 470.1, "render_fps": 14.6, "binning_pct": 17}
+  ],
+  "rtx3090_standard": [
+    {"G": 100000,  "it_per_s": 47.01, "render_fps": 1130.4, "peak_vram_gb": 0.64},
+    {"G": 300000,  "it_per_s": 38.7,  "render_fps": 626.5,  "peak_vram_gb": 0.7},
+    {"G": 1000000, "it_per_s": 27.09, "render_fps": 228.2,  "peak_vram_gb": 1.1},
+    {"G": 2000000, "it_per_s": 20.62, "render_fps": 142.6,  "peak_vram_gb": 1.82},
+    {"G": 3000000, "it_per_s": 16.62, "render_fps": 101.5,  "peak_vram_gb": 2.58}
+  ]
+}

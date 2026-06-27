@@ -1,0 +1,19 @@
+# CUDA verification environment (Nvidia GPU VM, e.g. RTX 3090 / Ampere sm_86) — a FAST box for
+# running the pure-PyTorch spike/ (the matrix-native math). NO tt-metal / ttsim here (those are the TT
+# toolchain; the GPU only accelerates the hardware-independent (B) reference + experiments).
+# torch is pinned to 2.4.1 to match the `sim` CPU env for behavioral parity.
+ARG PYTORCH_TAG=2.4.1-cuda12.1-cudnn9-runtime
+FROM pytorch/pytorch:${PYTORCH_TAG}
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      git build-essential vim less ripgrep curl wget ca-certificates tmux \
+    && rm -rf /var/lib/apt/lists/*
+
+# Base image already ships torch(+CUDA)/numpy/pillow; add SSIM + pytest to match the sim env.
+# (pillow listed explicitly in case a future base tag drops it.)
+RUN pip install --no-cache-dir pillow pytorch-msssim==1.0.0 pytest==8.3.3
+
+ENV PYTHONUNBUFFERED=1
+WORKDIR /workspace
+CMD ["/bin/bash"]

@@ -1,0 +1,34 @@
+tt-splat
+Copyright 2026 Kansei Motoe
+
+Licensed under the Apache License, Version 2.0 (see the LICENSE file).
+
+================================================================================
+Third-party components and acknowledgements
+================================================================================
+
+Device runtime
+--------------
+  * Tenstorrent tt-metal / ttnn (Apache-2.0)
+      https://github.com/tenstorrent/tt-metal
+      The Blackhole device kernels are written against the ttnn API.
+
+Baseline / comparison
+---------------------
+  * gsplat — nerfstudio-project/gsplat (Apache-2.0)
+      https://github.com/nerfstudio-project/gsplat
+      Used as the standard sorted-alpha 3DGS baseline and quality oracle
+      (the "standard 3DGS" numbers and panels in this repo).
+
+Referenced algorithms (math / ideas only — no third-party rendering code is
+vendored; the renderer is an independent re-derivation into GEMMs)
+-----------------------------------------------------------------------------
+  * "3D Gaussian Splatting for Real-Time Radiance Field Rendering"
+      Kerbl, Kopanas, Leimkuehler, Drettakis — SIGGRAPH 2023.
+  * "3D Gaussian Splatting as Markov Chain Monte Carlo"
+      Kheradmand et al. — NeurIPS 2024 (the fixed-count MCMC density control).
+  * "Weighted Sum Rendering ..." — arXiv:2410.18931 (the order-independent blend).
+
+Other
+-----
+  * PyTorch (BSD-3-Clause) — the CPU reference implementation and trainer.

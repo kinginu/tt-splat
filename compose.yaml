@@ -1,0 +1,106 @@
+# Single source of truth for the container environment (the repo is mounted, so host and container see the same files).
+#
+# Four services, two kinds:
+#   DEV environments (interactive; have a parallel .devcontainer/<name>/devcontainer.json):
+#     sim  — Phase 1, CPU + ttsim (kernel dev). Default service (no profile); devcontainer is compose-based.
+#     cuda — Phase 1, Nvidia GPU (fast (B)-math dev). Profile `cuda`; devcontainer is image-based (see note there).
+#   RUN-ONLY services (batch/target; no devcontainer):
+#     baseline — gsplat standard-3DGS comparison oracle. Profile `baseline`, GPU.
+#     hw       — Phase 2, real Blackhole. Profile `hw`, /dev/tenstorrent passthrough.
+services:
+  # Phase 1 dev service (CPU + ttsim, no silicon). The devcontainer targets this.
+  sim:
+    build:
+      context: .
+      args: { TT_METAL_TAG: v0.70.0, TTSIM_VERSION: v1.8.0 }
+    image: tt-splat:dev
+    environment:
+      # Tell tt-metal to use the ttsim .so instead of a real device. (Var name verified
+      # against tt-metal source, 2026-06-17. A soc_descriptor.yaml is staged beside the .so
+      # in the image — the ttsim release ships only the .so.)
+      - TT_METAL_SIMULATOR=/opt/ttsim/libttsim_bh.so
+      # The simulator has no fast-dispatch command-queue host channels, so device open fails
+      # in fast dispatch ("host channel does not exist"). Slow dispatch is required under ttsim.
+      - TT_METAL_SLOW_DISPATCH_MODE=1
+    volumes: [".:/workspace"]
+    working_dir: /workspace
+    shm_size: "16gb"
+    stdin_open: true
+    tty: true
+    command: bash
+
+  # Phase 1 FAST verification on an Nvidia GPU VM (e.g. RTX 3090). Runs the pure-PyTorch spike/
+  # (the matrix-native math) on GPU — no tt-metal/ttsim. Profile-gated; naming it on the CLI auto-enables it:
+  #   docker compose run --rm cuda python -m spike.m05_spike --res 128 --G 8000 --seeds 3
+  # Host prereqs: NVIDIA driver (verify `nvidia-smi`) + nvidia-container-toolkit, CONFIGURED:
+  #   sudo nvidia-ctk runtime configure --runtime=docker && sudo systemctl restart docker
+  #   sanity-check:  docker run --rm --gpus all tt-splat:cuda nvidia-smi
+  cuda:
+    profiles: ["cuda"]
+    build:
+      context: .
+      dockerfile: Dockerfile.cuda
+      args: { PYTORCH_TAG: 2.4.1-cuda12.1-cudnn9-runtime }
+    image: tt-splat:cuda
+    environment:
+      - EXPECT_CUDA=1              # m05_spike fails LOUD if the GPU isn't visible (vs silent CPU fallback)
+    # Portable GPU reservation: honored by `docker compose run` AND works on Compose v2 < 2.30
+    # (the one-line `gpus: all` shorthand needs Compose >= 2.30.0, else it's silently ignored).
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    volumes: [".:/workspace"]
+    working_dir: /workspace
+    shm_size: "16gb"
+    stdin_open: true
+    tty: true
+    command: bash
+
+  # Standard 3DGS baseline (gsplat) — the comparison ORACLE for matrix-native 3DGS.
+  # Same torch/CUDA as `cuda`; only the renderer math differs. Profile-gated like `cuda`:
+  #   docker compose run --rm baseline python tools/baseline_gsplat.py --res 128 --G 2000 --iters 3000
+  # Same host prereqs as `cuda` (NVIDIA driver + nvidia-container-toolkit configured).
+  baseline:
+    profiles: ["baseline"]
+    build:
+      context: .
+      dockerfile: Dockerfile.baseline
+      args: { GSPLAT_VERSION: 1.5.3 }   # base is python:3.10-slim (py3.10 so the gsplat wheel's _C loads, no nvcc)
+    image: tt-splat:baseline
+    environment:
+      - EXPECT_CUDA=1              # gsplat needs a GPU; fail LOUD rather than error cryptically on CPU
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    volumes: [".:/workspace"]
+    working_dir: /workspace
+    shm_size: "16gb"
+    stdin_open: true
+    tty: true
+    command: bash
+
+  # Phase 2 only (real Blackhole). Starts only when `--profile hw` is passed.
+  hw:
+    profiles: ["hw"]
+    build:
+      context: .
+      args: { TT_METAL_TAG: v0.70.0, TTSIM_VERSION: v1.8.0 }
+    image: tt-splat:dev
+    devices: ["/dev/tenstorrent:/dev/tenstorrent"]
+    volumes:
+      - /dev/hugepages-1G:/dev/hugepages-1G
+      - .:/workspace
+    working_dir: /workspace
+    shm_size: "32gb"
+    cap_add: ["SYS_NICE"]
+    stdin_open: true
+    tty: true
+    command: bash

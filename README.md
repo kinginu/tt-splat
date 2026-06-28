@@ -109,31 +109,36 @@ at every step.
 
 ## Rendering comparison
 
-### Synthetic, matched count (G=2000)
+> **A dedicated renderer is required — a standard `.ply` viewer will not display this correctly.**
+> Matrix-native 3DGS changes the rendering math *used during training*: a polynomial splat kernel
+> `(1−Q/k)₊²` (no `exp`) and order-independent **weighted-sum blending** (no depth sort), instead of standard
+> 3DGS's exp-Gaussian + sorted-alpha. The gaussians are **fit to that renderer**, so opening our `.ply` in a
+> standard 3DGS viewer applies the wrong math and will **not** reproduce the trained appearance — a renderer
+> matching the training-time math is required (a viewer for it is in progress for release). *(Our `.ply` also
+> stores DC colour only, no SH-rest, so the faithful reference is the rendered image, not the `.ply`.)*
 
-Held-out views — same scenes, split, and gaussian count as the accuracy table. Panels left→right:
-**GT · standard 3DGS (gsplat) · matrix-native 3DGS (ours)**. *(The third-panel image label is an older
-internal name for the same matrix-native renderer.)*
-
-**ficus** (fuzzy — on par with gsplat):
+**ficus** (fuzzy, **G=2000 / res128** — on par with gsplat). Panels: **GT · standard 3DGS (gsplat) · matrix-native (ours)**:
 
 ![ficus view 0](docs/benchmark-ficus-lego/ficus_test_view00_cmp.png)
 ![ficus view 1](docs/benchmark-ficus-lego/ficus_test_view01_cmp.png)
 
-**lego** (solid occluder — ours is blurrier; depth-free WSR averages where sorted-alpha occludes):
+**lego** (solid occluder, **G=100k / res800, fully matched** — held-out **16.55 vs gsplat 34.47, −17.9 dB**).
+Panels: **GT · matrix-native (ours) · standard 3DGS (gsplat)**. Depth-free WSR averages where sorted-alpha
+occludes → our column collapses to a blur (the high-res occlusion ceiling):
 
-![lego view 0](docs/benchmark-ficus-lego/lego_test_view00_cmp.png)
-![lego view 1](docs/benchmark-ficus-lego/lego_test_view01_cmp.png)
+![lego matched 0](docs/matched-views/lego_compare_holdout_0.png)
+![lego matched 1](docs/matched-views/lego_compare_holdout_1.png)
 
-### Real scene — playroom (G=100k)
+**playroom** (real scene, **G=100k / downscale-4, fully matched** — held-out **20.11 vs gsplat 29.24, −9.1 dB**).
+Panels: **GT · matrix-native (ours) · standard 3DGS (gsplat)**. Colour and layout recovered, blurrier than sorted-alpha:
 
-GT · matrix-native 3DGS (ours, held-out 17.4 dB) · standard 3DGS (gsplat, 26.5 dB), the same held-out
-viewpoints. Ours recovers the scene's colour and layout (the striped rug, the toys, the furniture) but is
-blurrier — the depth-free WSR ceiling — where sorted-alpha gsplat stays crisp.
+![playroom matched 0](docs/matched-views/playroom_compare_holdout_0.png)
+![playroom matched 1](docs/matched-views/playroom_compare_holdout_1.png)
 
-![playroom held-out 0](docs/compare-views/playroom_0.png)
-![playroom held-out 1](docs/compare-views/playroom_1.png)
-![playroom held-out 2](docs/compare-views/playroom_2.png)
+> *Matched 2026-06-28: the earlier playroom "17.4 vs 26.5" compared different resolutions (ours full 1264×832
+> vs gsplat ¼-res 316×208) and an unmatched/DC-only gsplat. Resolution-matched + split-verified + both SH-3 +
+> MCMC, the honest numbers are **20.11 / 29.24**. Lego/playroom panels are view-for-view (shared
+> `tools/render_panels.py` held-out cameras); ficus stays at the G=2000 sweet-spot config.*
 
 ---
 

@@ -37,6 +37,77 @@ def blend_B(w_geo, opacity_raw, depth, depth_beta, depth_tau, color, w_b, c_b):
     return _wsr(o[None, :] * w_geo * rho[None, :], color, w_b, c_b)
 
 
+def _depth_warp(depth, near=0.5, far=8.0):
+    """Map camera z to [0,1] for numerical stability of power basis."""
+    return ((depth - near) / (far - near)).clamp(0.0, 1.0)
+
+
+def _moment_reconstruct(b, zw, m=4, eps=1e-6):
+    """Per-(pixel,gaussian) CDF fraction Â(z_g) in [0,1] using m+1 power moments.
+    b: [P, m+1], zw: [G] in [0,1]. Returns A_hat [P, G].
+
+    Strategy: minimum-norm / least-squares weight recovery on the Vandermonde system
+    zp.T @ w[p] = b_hat[p], then exact exclusive step CDF in depth order.
+
+    For G < m+1 (e.g. 2-gaussian toy): overdetermined → least-squares via Gram [G,G].
+      Recovers w ≈ a[g]/b0 exactly when the system is consistent.
+    For G >= m+1 (e.g. 16-gaussian oracle): underdetermined → minimum-norm via Gram [m+1,m+1].
+      w[g] = polynomial(zw[g]); when a[g]/b0 is approximately uniform the step CDF ≈ empirical CDF.
+
+    Sort is detached so grads flow through the recovered weights w (which depend on zw via zp
+    and b_hat), keeping the depth channel differentiable (C3).
+    """
+    P = b.shape[0]
+    G = zw.shape[0]
+    b0 = b[:, 0:1].clamp(min=eps)    # [P, 1]
+    b_hat = b / b0                     # [P, m+1]
+
+    # Vandermonde power basis: zp[g, n] = zw[g]^n
+    zp = torch.stack([zw ** n for n in range(m + 1)], dim=-1)  # [G, m+1]
+
+    reg = eps * float(max(G, m + 1))
+
+    if G >= m + 1:
+        # Underdetermined: minimum-norm solution w = zp @ solve(zp.T @ zp, b_hat.T)
+        gram = zp.T @ zp + reg * torch.eye(m + 1, dtype=b.dtype, device=b.device)
+        c = torch.linalg.solve(gram, b_hat.T)   # [m+1, P]
+        w = (zp @ c).T                           # [P, G]
+    else:
+        # Overdetermined: least-squares w = solve(zp @ zp.T, zp @ b_hat.T)
+        gram2 = zp @ zp.T + reg * torch.eye(G, dtype=b.dtype, device=b.device)
+        w = torch.linalg.solve(gram2, (zp @ b_hat.T)).T  # [P, G]
+
+    # Exclusive step CDF: sort by depth (detached), exclusive cumsum of w
+    order = zw.argsort().detach()               # [G]
+    w_sorted = w[:, order]                      # [P, G] sorted by depth
+    zeros = torch.zeros(P, 1, dtype=b.dtype, device=b.device)
+    cum_excl = torch.cat([zeros, w_sorted[:, :-1].cumsum(dim=1)], dim=1)  # [P, G]
+    A_hat = torch.zeros(P, G, dtype=b.dtype, device=b.device)
+    A_hat[:, order] = cum_excl
+
+    return A_hat.clamp(0.0, 1.0)
+
+
+def blend_MO(w_geo, opacity_raw, depth, color, w_b, c_b, m=4, eps=1e-6):
+    """Moment-based OIT (candidate #3): per-pixel transmittance from m power moments of the
+    (depth, absorbance) measure; reconstruct T_i = exp(-b0 * Â(z_i)), composite OIT-over.
+    Sort-free (moments = GEMM, reconstruction = polynomial eval per pixel); z ATTACHED (C3).
+    OIT-style composite (not WSR): background gets true residual transmittance exp(-b0).
+    Reference: Münstermann et al. 2018, Moment-Based Order-Independent Transparency."""
+    o = torch.sigmoid(opacity_raw)
+    alpha = (o[None, :] * w_geo).clamp(eps, 1.0 - 1e-4)       # [P, G]
+    a = -torch.log1p(-alpha)                                    # [P, G] per-(p,g) absorbance
+    zw = _depth_warp(depth)                                     # [G] in [0,1]; attached
+    zp = torch.stack([zw ** n for n in range(m + 1)], dim=-1)  # [G, m+1]
+    b = a @ zp                                                  # [P, m+1] moments (GEMM)
+    A_frac = _moment_reconstruct(b, zw, m=m, eps=eps)          # [P, G] CDF fraction in [0,1]
+    T = torch.exp(-b[:, 0:1] * A_frac)                         # [P, G] transmittance
+    W = alpha * T                                               # [P, G]
+    num = W @ color                                             # [P, 3]
+    T_bg = torch.exp(-b[:, 0:1])                               # [P, 1] residual transmittance
+    return num + T_bg * c_b[None, :]
+
+
 def blend_C0(w_geo, opacity_sh, color, w_b, c_b):
     o = torch.sigmoid(sh.opacity_dc(opacity_sh))               # DC-only: no view dependence
     return _wsr(o[None, :] * w_geo, color, w_b, c_b)

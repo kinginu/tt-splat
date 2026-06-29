@@ -1,0 +1,26 @@
+{
+  // Optional VS Code "Reopen in Container" definition for the sim (ttsim) service.
+  // The environment is defined entirely by compose.yaml; this file just points VS Code at it.
+  // Day-to-day work does not require it -- you can use `docker compose run --rm sim` directly;
+  // its only benefit is language servers / completion aligned with the in-container toolchain.
+  // COMPOSE-based (unlike the cuda devcontainer, which is image-based): `sim` is the default,
+  // non-profiled compose service, so VS Code can bring it up directly.
+  "name": "tt-splat (sim / ttsim)",
+  "dockerComposeFile": "../../compose.yaml",
+  "service": "sim",
+  "workspaceFolder": "/workspace",
+
+  // Don't stop the container when the editor closes.
+  "shutdownAction": "none",
+
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "llvm-vs-code-extensions.vscode-clangd",
+        "ms-python.python",
+        "redhat.vscode-yaml",
+        "davidanson.vscode-markdownlint"
+      ]
+    }
+  }
+}

@@ -6,12 +6,12 @@ Ties the shared geometry (geometry.project_ewa) to the novel per-pixel forward
 import torch
 import torch.nn.functional as F
 
-from . import arms, camera as cam_mod, forward, geometry
+from . import arms, camera as cam_mod, forward, geometry, sh
 
 ARMS = ("A", "B", "C0", "C", "SZ", "RV", "D")
 
 
-def render(model, cam, arm, k=4.0, blur_eps=0.3, near=0.2):
+def render(model, cam, arm, k=4.0, blur_eps=0.3, near=0.2, sh_degree=0):
     R = geometry.quat_to_rotmat(model.quats)
     cov = geometry.cov3d(torch.exp(model.log_scales), R)
     mu2d, conic_abc, depth, keep = geometry.project_ewa(
@@ -20,7 +20,11 @@ def render(model, cam, arm, k=4.0, blur_eps=0.3, near=0.2):
     px, py = cam_mod.pixel_grid(cam.H, cam.W, dtype=model.means3d.dtype, device=model.means3d.device)
     Q = forward.quad_form(px, py, mu2d, conic_abc)               # [P,G]
     w_geo = forward.poly_splat_wgeo(Q, k, keep)
-    color = forward.color_from_dc(model.color_dc)                # [G,3]
+    if sh_degree > 0 and hasattr(model, "color_rest"):           # view-dependent SH colour
+        coeffs = torch.cat([model.color_dc[:, None, :], model.color_rest], dim=1)   # [G,16,3]
+        color = sh.eval_sh_color(sh_degree, coeffs, model.means3d - cam.center[None, :])
+    else:
+        color = forward.color_from_dc(model.color_dc)            # [G,3] DC-only
     w_b = F.softplus(model.w_b_raw)
     c_b = model.c_b
 

@@ -62,6 +62,8 @@ def relocate(model, dead_thr=0.005, offset=0.0):
         model.log_scales[d] = model.log_scales[t]
         model.quats[d] = model.quats[t]
         model.color_dc[d] = model.color_dc[t]
+        if hasattr(model, "color_rest"):
+            model.color_rest[d] = model.color_rest[t]      # carry SH colour through relocation
         model.opacity_sh[d] = model.opacity_sh[t]
         model.opacity_raw[d] = _logit(new_o[t])
 
@@ -69,7 +71,7 @@ def relocate(model, dead_thr=0.005, offset=0.0):
     return dead.numel(), touched
 
 
-_PER_GAUSSIAN = ("means3d", "log_scales", "quats", "opacity_raw", "color_dc", "opacity_sh")
+_PER_GAUSSIAN = ("means3d", "log_scales", "quats", "opacity_raw", "color_dc", "color_rest", "opacity_sh")
 
 
 @torch.no_grad()
@@ -87,7 +89,7 @@ def reset_adam_state(opt, model, idx):
 
 def train_mcmc(model, cameras, gt_images, arm, iters=600, lr=None, relocate_every=100,
                dead_thr=0.005, offset=0.005, lambda_o=0.01, lambda_s=0.01, noise_lr=5e5,
-               k=4.0, blur_eps=0.3, near=0.2, log_every=0):
+               k=4.0, blur_eps=0.3, near=0.2, log_every=0, sh_degree=0):
     """MCMC fixed-count training. Returns (loss_history, total_relocations)."""
     lr = {**train.DEFAULT_LR, **(lr or {})}
     opt = torch.optim.Adam(model.param_groups(lr))
@@ -96,7 +98,7 @@ def train_mcmc(model, cameras, gt_images, arm, iters=600, lr=None, relocate_ever
         opt.zero_grad(set_to_none=True)
         photo = 0.0
         for cam, gt in zip(cameras, gt_images):
-            photo = photo + metrics.loss_fn(render(model, cam, arm, k=k, blur_eps=blur_eps, near=near), gt)
+            photo = photo + metrics.loss_fn(render(model, cam, arm, k=k, blur_eps=blur_eps, near=near, sh_degree=sh_degree), gt)
         loss = photo / len(cameras) + reg_loss(model, lambda_o, lambda_s)
         loss.backward()
         opt.step()

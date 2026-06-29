@@ -32,13 +32,14 @@ def _spread(n_total, n):
     return max(1, n_total // max(1, n))
 
 
-def run_arm(arm, tr_cams, tr_imgs, ho_cams, ho_imgs, G, iters, seed, extent, lr=None, device="cpu"):
+def run_arm(arm, tr_cams, tr_imgs, ho_cams, ho_imgs, G, iters, seed, extent, lr=None, device="cpu",
+            sh_degree=0):
     model = GaussianModel(G, extent=extent, seed=seed, device=device)
     t0 = time.time()
-    hist = train.fit(model, tr_cams, tr_imgs, arm, iters=iters, lr=lr)
+    hist = train.fit(model, tr_cams, tr_imgs, arm, iters=iters, lr=lr, sh_degree=sh_degree)
     dt = time.time() - t0
-    tr_psnr = train.eval_psnr(model, tr_cams, tr_imgs, arm)
-    ho_psnr = train.eval_psnr(model, ho_cams, ho_imgs, arm) if ho_cams else float("nan")
+    tr_psnr = train.eval_psnr(model, tr_cams, tr_imgs, arm, sh_degree=sh_degree)
+    ho_psnr = train.eval_psnr(model, ho_cams, ho_imgs, arm, sh_degree=sh_degree) if ho_cams else float("nan")
     return {"arm": arm, "G": G, "seed": seed, "train_psnr": tr_psnr, "holdout_psnr": ho_psnr,
             "final_loss": hist[-1], "params_per_g": PARAMS_PER_GAUSSIAN[arm], "secs": dt}
 
@@ -126,6 +127,7 @@ def main():
     ap.add_argument("--n-holdout", type=int, default=2)
     ap.add_argument("--extent", type=float, default=1.5)
     ap.add_argument("--arms", default="A,B,C0,C,D")
+    ap.add_argument("--sh-degree", type=int, default=0, help="view-dependent SH colour degree (0=DC)")
     ap.add_argument("--preflight", default="", help="comma G list for the arm-D floor check, e.g. 500,2000,8000")
     ap.add_argument("--device", default=None, help="cuda|cpu|cuda:0; default auto (CUDA if available)")
     ap.add_argument("--out", default="outputs/m05")
@@ -156,7 +158,7 @@ def main():
     rows = []
     for seed in range(args.seeds):
         for arm in arms:
-            r = run_arm(arm, tr_cams, tr_imgs, ho_cams, ho_imgs, args.G, args.iters, seed, args.extent, device=dev)
+            r = run_arm(arm, tr_cams, tr_imgs, ho_cams, ho_imgs, args.G, args.iters, seed, args.extent, device=dev, sh_degree=args.sh_degree)
             print(f"  [{arm:>2} seed{seed}] train {r['train_psnr']:.2f}  holdout {r['holdout_psnr']:.2f}  "
                   f"loss {r['final_loss']:.4f}  ({r['secs']:.0f}s)")
             rows.append(r)

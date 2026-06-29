@@ -119,15 +119,36 @@ def main():
                     help="train on ALL views (per-iter random), held-out every-8th for eval; forces host loss")
     ap.add_argument("--profile", action="store_true",
                     help="time the remaining HOST blocks (binning, scatter) to see what's worth device-izing")
+    ap.add_argument("--sh-degree", type=int, default=0,
+                    help="view-dependent SH colour degree (0=DC-only; 3=full). Host SH eval -> upload -> device render.")
+    ap.add_argument("--relocate-every", type=int, default=0,
+                    help="fixed-count MCMC density control: relocate dead (o<thr) slots onto live ones every N "
+                         "iters (host-controlled, contribution-preserving o->o/n). 0=off.")
+    ap.add_argument("--dead-thr", type=float, default=0.005, help="opacity threshold for a 'dead' gaussian (MCMC)")
+    ap.add_argument("--lambda-o", type=float, default=0.0, help="MCMC opacity-L1 reg (drives low contributors dead)")
+    ap.add_argument("--lambda-s", type=float, default=0.0, help="MCMC scale-L1 reg (discourages oversized gaussians)")
+    ap.add_argument("--noise-lr", type=float, default=0.0, help="MCMC SGLD Langevin-noise scale on near-dead means (e.g. 5e5)")
+    # random-bg: per-iter random background compositing (gsplat-style honest opacity; WSR else bakes the bg
+    # into the normalized average -> grey/white empty-space haze). NeRF-synthetic + --multi-view only; eval stays white.
+    ap.add_argument("--random-bg", action="store_true",
+                    help="per-iter random-bg compositing (NeRF-synthetic + --multi-view); eval renders on white")
+    # depth-weight lever: rho=sigmoid(beta*(tau-depth)), sort-free, multiplies o.
+    ap.add_argument("--depth-weight", action="store_true",
+                    help="per-gaussian monotonic depth weight (offsets random-bg's white-fill loss; device-resident)")
+    ap.add_argument("--beta0", type=float, default=1.0)
+    ap.add_argument("--tau0", type=float, default=4.0, help="refined from the depth median at warmup")
+    ap.add_argument("--lr-bt", type=float, default=0.02, help="Adam LR for the 2 global beta/tau scalars")
     args = ap.parse_args()
-    if args.multi_view:
-        args.device_loss = False        # device-loss precomputes GT-derived SSIM matrices -> per-view recompute
-                                         # needed; use host loss (reads the per-iter gt) for multi-view v1
+    if args.colmap:
+        args.random_bg = False         # real scenes have full backgrounds (no alpha) -> no random-bg
+    # multi-view + --device-loss now works: the per-view GT SSIM stats are recomputed ON DEVICE each iter
+    # (recompute_gt_stats); without --device-loss, multi-view falls back to host loss.
     DEV = ttnn.open_device(device_id=0, trace_region_size=512 * 1024 * 1024)
     try:
         CG = ttnn.CoreGrid(x=11, y=10)
         res, G, K = args.res, args.G, args.K
         torch.manual_seed(0)
+        tr_pm = tr_tr = None                              # random-bg: per-view premult colour + transmittance
         if args.colmap:                                   # real scene: COLMAP poses + point-init
             from spike.camera import Camera
             cams, imgs = data.load_colmap(args.colmap, downscale=args.downscale,
@@ -155,8 +176,19 @@ def main():
                   f"{len(pxyz)} pts" + (f" | {len(tr_cams)} train / {len(te_cams)} test views"
                                         if args.multi_view else " (single view)"), flush=True)
         else:
-            cams, imgs = data.load_blender(args.scene, "train", res=res, n=1)
-            cam, gt = cams[0], imgs[0]
+            if args.multi_view:                            # NeRF-synthetic: all train views + held-out test
+                tr_cams, tr_imgs = data.load_blender(args.scene, "train", res=res)
+                te_cams, te_imgs = data.load_blender(args.scene, "test", res=res, n=25, stride=8)
+                if args.random_bg:                         # keep-alpha train set (same default selection as tr_imgs)
+                    _, tr_rgba = data.load_blender(args.scene, "train", res=res, keep_alpha=True)
+                    tr_pm = [(im[..., :3] * im[..., 3:4]).permute(2, 0, 1).contiguous() for im in tr_rgba]   # [3,H,W]
+                    tr_tr = [(1.0 - im[..., 3:4]).expand(-1, -1, 3).permute(2, 0, 1).contiguous() for im in tr_rgba]
+                cam, gt = tr_cams[0], tr_imgs[0]
+                print(f"[blender] {args.scene} -> {res}x{res}, G={G} | "
+                      f"{len(tr_cams)} train / {len(te_cams)} test views", flush=True)
+            else:
+                cams, imgs = data.load_blender(args.scene, "train", res=res, n=1)
+                cam, gt = cams[0], imgs[0]
             tmap = TileMap(res, res)
             m = GaussianModel(G, extent=1.5, seed=0)
         T = tmap.T
@@ -168,12 +200,16 @@ def main():
         Rv = [[cbuf(cam.R_v[i, j]) for j in range(3)] for i in range(3)]
         tv = [cbuf(cam.t_v[i]) for i in range(3)]
         fx, fy, cx, cy = cbuf(cam.fx), cbuf(cam.fy), cbuf(cam.cx), cbuf(cam.cy)
+        # camera centre (world) as fp32 buffers [G,1] for the device SH view direction (means - centre)
+        cfp = lambda v: ttnn.from_torch(torch.full((G, 1), float(v)), dtype=DT, layout=ttnn.TILE_LAYOUT, device=DEV)
+        ctr = [cfp(cam.center[i]) for i in range(3)]
 
         def set_cam(c):
             for i in range(3):
                 for j in range(3):
                     setbuf(Rv[i][j], torch.full((G, 1), float(c.R_v[i, j])))
                 setbuf(tv[i], torch.full((G, 1), float(c.t_v[i])))
+                setbuf(ctr[i], torch.full((G, 1), float(c.center[i])), DT)
             for buf, v in ((fx, c.fx), (fy, c.fy), (cx, c.cx), (cy, c.cy)):
                 setbuf(buf, torch.full((G, 1), float(v)))
         from spike.train import DEFAULT_LR
@@ -197,6 +233,35 @@ def main():
         mom_m = u(torch.zeros(G, len(PN)))
         vom_m = u(torch.zeros(G, len(PN)))
         LR_vec = u(torch.tensor([[LR[k] for k in PN]], dtype=torch.float32))   # [1,14], broadcast over G
+
+        # ===== SH view-dependent colour: cr/cg/cb (DC) + color_rest as DEVICE params, evaluated ON DEVICE =====
+        from spike.sh import C0, C1, C2, C3
+        SHD = args.sh_degree
+        if SHD > 0:                                                            # rest coeffs as [G,1]x15 (NO concat:
+            crest = [[u(m.color_rest[:, l, ci]) for l in range(15)] for ci in range(3)]    # the [G,15] concat blew L1 at G=250k)
+            crest_mom = [[u(torch.zeros(G)) for _ in range(15)] for _ in range(3)]
+            crest_vom = [[u(torch.zeros(G)) for _ in range(15)] for _ in range(3)]
+            LR_REST = DEFAULT_LR["color"] / 20.0
+
+            def sh_color_dev(vx, vy, vz, dc):
+                """ON-DEVICE SH eval (verified brick, tools/sh_device): viewdir -> 15 rest-basis (each [G,1],
+                no concat) + DC -> color[ch]=relu(0.5 + C0*dc[ch] + sum_l b_l*crest[ch][l]). Returns (color, blist)."""
+                M, A, S = ttnn.mul, ttnn.add, ttnn.sub
+                inv = ttnn.rsqrt(A(A(A(M(vx, vx), M(vy, vy)), M(vz, vz)), 1e-12))
+                x, y, z = M(vx, inv), M(vy, inv), M(vz, inv)
+                xx, yy, zz, xy, yz, xz = M(x, x), M(y, y), M(z, z), M(x, y), M(y, z), M(x, z)
+                blist = [M(y, -C1), M(z, C1), M(x, -C1),
+                         M(xy, C2[0]), M(yz, C2[1]), M(S(M(zz, 2.0), A(xx, yy)), C2[2]), M(xz, C2[3]), M(S(xx, yy), C2[4]),
+                         M(M(y, S(M(xx, 3.0), yy)), C3[0]), M(M(xy, z), C3[1]), M(M(y, S(M(zz, 4.0), A(xx, yy))), C3[2]),
+                         M(M(z, S(M(zz, 2.0), A(M(xx, 3.0), M(yy, 3.0)))), C3[3]), M(M(x, S(M(zz, 4.0), A(xx, yy))), C3[4]),
+                         M(M(z, S(xx, yy)), C3[5]), M(M(x, S(xx, M(yy, 3.0))), C3[6])]              # 15 x [G,1]
+                color = []
+                for ci in range(3):
+                    s = M(dc[ci], C0)
+                    for l in range(15):
+                        s = A(s, M(blist[l], crest[ci][l]))
+                    color.append(ttnn.relu(A(s, 0.5)))
+                return color, blist
         idx_u = ttnn.from_torch(torch.zeros(T, K, dtype=torch.int32), dtype=ttnn.uint32, layout=ttnn.ROW_MAJOR_LAYOUT, device=DEV)
         valid6 = u(torch.zeros(T, 6, K), BF)
         vf = u(torch.zeros(T, K, 1), BF)
@@ -210,6 +275,15 @@ def main():
         gcon_buf = {k: u(torch.zeros(G)) for k in ("a", "b", "c", "mx", "my")}  # geom-bwd grad inputs
         gco_buf = [u(torch.zeros(G)) for _ in range(3)]
         gocl_buf = u(torch.zeros(G))
+        # depth-weight lever buffers: rho=sigmoid(beta*(tau-depth)); global beta/tau scalars
+        # broadcast to [G,1] device buffers (device fwd/bwd), host-Adam updated per iter (2 scalars, light host glue).
+        beta_buf = u(torch.full((G,), float(args.beta0)))
+        tau_buf = u(torch.full((G,), float(args.tau0)))
+        gbeta_buf = u(torch.zeros(G))
+        gtau_buf = u(torch.zeros(G))
+        bt = {"beta": float(args.beta0), "tau": float(args.tau0)}
+        bt_m = {"beta": 0.0, "tau": 0.0}
+        bt_v = {"beta": 0.0, "tau": 0.0}
         # device-scatter (bin->gaussian grad reduce on device): inv[G,Smax] slot table + zero sentinel row
         SMAX = (2 * 1 + 1) ** 2                         # R=1 stencil -> <=9 valid slots per gaussian
         sinv_u = ttnn.from_torch(torch.full((G, SMAX), T * K, dtype=torch.int32),
@@ -218,7 +292,7 @@ def main():
         def set_sinv(idx, valid):
             setbuf(sinv_u, build_inv(idx, valid, G, SMAX).to(torch.int32), ttnn.uint32, ttnn.ROW_MAJOR_LAYOUT)
 
-        # device-binning CONSTANTS preallocated ONCE (no per-bin-every from_torch -> kills the ~170ms,)
+        # device-binning CONSTANTS preallocated ONCE (no per-bin-every from_torch -> kills the ~170ms)
         bin_ctx = make_bin_ctx(tmap, G, K, DEV) if args.device_binning else None
 
         # ---- device-loss constants (banded Gaussian GEMM matrices, gt y-maps, gidx gathers) ----
@@ -243,19 +317,43 @@ def main():
             gidx_u = ttnn.from_torch(tmap.gidx.to(torch.int32), dtype=ttnn.uint32, layout=ttnn.ROW_MAJOR_LAYOUT, device=DEV)
             inv_u = ttnn.from_torch(inv.to(torch.int32), dtype=ttnn.uint32, layout=ttnn.ROW_MAJOR_LAYOUT, device=DEV)
 
+            def recompute_gt_stats(gt_img):              # per-view GT SSIM stats ON DEVICE (multi-view device loss)
+                setbuf(y_d, gt_img.permute(2, 0, 1).contiguous(), DT)
+                f = lambda t: ttnn.matmul(ttnn.matmul(Mh_b, t), MwT_b)
+                ttnn.copy(f(y_d), muy_d)
+                ttnn.mul(muy_d, muy_d, output_tensor=muy2_d)
+                ttnn.copy(ttnn.sub(f(ttnn.mul(y_d, y_d)), muy2_d), sy_d)
+
         def geom_fwd():
             sx, sy, sz = ttnn.exp(P["lx"]), ttnn.exp(P["ly"]), ttnn.exp(P["lz"])
             cols = (P["mx"], P["my"], P["mz"], P["qw"], P["qx"], P["qy"], P["qz"], sx, sy, sz)
             _, _, cache = device_fwd_core(cols, Rv, tv, fx, fy, cx, cy, concat_out=False)  # columns in cache
             keep = cache["zmask"]
             o = ttnn.sigmoid(P["op"])
-            keo = M(keep, o)
-            color = [ttnn.relu(A(M(P[k], C0), 0.5)) for k in ("cr", "cg", "cb")]
+            if args.depth_weight:                                    # depth weight: rho=sigmoid(beta*(tau-mcz)) x o
+                rho = ttnn.sigmoid(M(beta_buf, A(tau_buf, ttnn.neg(cache["mcz"]))))   # mcz = camera-space z depth
+                cache["rho"] = rho
+                keo = M(M(keep, o), rho)
+            else:
+                keo = M(keep, o)
+            if SHD > 0:                                              # device SH: viewdir = means - centre, eval on device
+                color, blist = sh_color_dev(ttnn.sub(P["mx"], ctr[0]), ttnn.sub(P["my"], ctr[1]),
+                                            ttnn.sub(P["mz"], ctr[2]), [P["cr"], P["cg"], P["cb"]])
+            else:
+                color = [ttnn.relu(A(M(P[k], C0), 0.5)) for k in ("cr", "cg", "cb")]
+                blist = keo                                          # unused placeholder (DC mode)
             co = [M(keo, color[0]), M(keo, color[1]), M(keo, color[2])]   # color_o columns [G,1] (no concat)
-            return cache, keep, keo, o, color, co
+            return cache, keep, keo, o, color, co, blist
 
         # forward state holders (set by warmup, reassigned by capture)
-        cache, keep, keo, o, color, co = geom_fwd()
+        cache, keep, keo, o, color, co, blist = geom_fwd()
+        if args.depth_weight:                              # refine tau0 to the actual depth (camera-z) distribution
+            ttnn.synchronize_device(DEV)
+            zc = dn(cache["mcz"]).reshape(-1); kc = dn(keep).reshape(-1) > 0.5
+            zv = zc[kc] if bool(kc.any()) else zc
+            bt["tau"] = float(zv.median()); setbuf(tau_buf, torch.full((G,), bt["tau"]), DT)
+            print(f"[depth-weight] beta0={bt['beta']:.3f} tau0={bt['tau']:.3f} lr_bt={args.lr_bt} "
+                  f"(z {float(zv.min()):.2f}..{float(zv.max()):.2f})", flush=True)
 
         def rend_fwd():
             theta, col_t, oc_t = gather_theta_cols(cache["ca"], cache["cb"], cache["cc"], cache["mu2d_x"],
@@ -303,16 +401,32 @@ def main():
                    "qy": gg["gqy"], "qz": gg["gqz"], "lx": M(gg["gsx"], sx), "ly": M(gg["gsy"], sy), "lz": M(gg["gsz"], sz)}
             # color/opacity bwd: color_o = keo*color, o_col=keo, keo=keep*o
             gkeo = A(A(M(gco_buf[0], color[0]), M(gco_buf[1], color[1])), A(M(gco_buf[2], color[2]), gocl_buf))
-            cmask = [ttnn.gtz(A(M(P[k], C0), 0.5)) for k in ("cr", "cg", "cb")]
-            # gcolor_dc = (gco*keo)*C0*cmask ; gop = (gkeo*keep)*o*(1-o)
-            out["cr"] = M(M(M(gco_buf[0], keo), cmask[0]), C0)
-            out["cg"] = M(M(M(gco_buf[1], keo), cmask[1]), C0)
-            out["cb"] = M(M(M(gco_buf[2], keo), cmask[2]), C0)
+            dcrest = [[None] * 15 for _ in range(3)]
+            if SHD > 0:                                              # device SH bwd: dL/dcolour -> DC + rest coeff grads
+                for ci, k in enumerate(("cr", "cg", "cb")):
+                    gg = M(M(gco_buf[ci], keo), ttnn.gtz(color[ci]))    # dL/dcolour[ch] through the relu gate
+                    out[k] = M(gg, C0)                                  # DC coeff grad
+                    for l in range(15):
+                        dcrest[ci][l] = M(blist[l], gg)               # rest coeff grad [G,1] (no concat)
+            else:
+                cmask = [ttnn.gtz(A(M(P[k], C0), 0.5)) for k in ("cr", "cg", "cb")]
+                out["cr"] = M(M(M(gco_buf[0], keo), cmask[0]), C0)
+                out["cg"] = M(M(M(gco_buf[1], keo), cmask[1]), C0)
+                out["cb"] = M(M(M(gco_buf[2], keo), cmask[2]), C0)
             one = ttnn.add(ttnn.mul(o, 0.0), 1.0)
-            out["op"] = M(M(gkeo, keep), M(o, ttnn.add(one, ttnn.neg(o))))
-            return out
+            o1mo = M(o, ttnn.add(one, ttnn.neg(o)))                 # sigmoid'(op) = o(1-o)
+            if args.depth_weight:                                  # keo=keep*o*rho -> extra rho factor + beta/tau grads
+                rho = cache["rho"]
+                out["op"] = M(M(M(gkeo, keep), o1mo), rho)
+                grad_rho = M(M(gkeo, keep), o)                     # dL/drho
+                grad_pre = M(grad_rho, M(rho, A(one, ttnn.neg(rho))))    # * rho(1-rho)
+                ttnn.copy(M(grad_pre, A(tau_buf, ttnn.neg(cache["mcz"]))), gbeta_buf)   # grad_beta_pg = grad_pre*(tau-mcz)
+                ttnn.copy(M(grad_pre, beta_buf), gtau_buf)                              # grad_tau_pg  = grad_pre*beta
+            else:
+                out["op"] = M(M(gkeo, keep), o1mo)
+            return out, dcrest
 
-        gout = geom_bwd()
+        gout, dcrest = geom_bwd()
 
         def loss_grad_dev():
             """C (device [T,256,3] bf16) -> dL/dC written into gC_buf, fully on device.
@@ -375,6 +489,28 @@ def main():
             for k, c in zip(PN, ttnn.split(step, 1, dim=1)):
                 ttnn.subtract(P[k], c, output_tensor=P[k])
 
+        def adam_crest(t):                                   # device Adam for the SH rest coeffs (3 x 15 x [G,1])
+            bc1, bc2 = 1.0 - B1 ** t, 1.0 - B2 ** t
+            for ci in range(3):
+                for l in range(15):
+                    g, mk, vk, p = dcrest[ci][l], crest_mom[ci][l], crest_vom[ci][l], crest[ci][l]
+                    ttnn.mul(mk, B1, output_tensor=mk); ttnn.add(mk, ttnn.mul(g, 1.0 - B1), output_tensor=mk)
+                    ttnn.mul(vk, B2, output_tensor=vk)
+                    ttnn.add(vk, ttnn.mul(ttnn.mul(g, g), 1.0 - B2), output_tensor=vk)
+                    denom = ttnn.add(ttnn.mul(ttnn.sqrt(vk), 1.0 / math.sqrt(bc2)), EPS)
+                    ttnn.subtract(p, ttnn.div(ttnn.mul(mk, LR_REST / bc1), denom), output_tensor=p)
+
+        def adam_bt(t):                                  # host Adam for the 2 global depth-weight scalars (beta/tau)
+            bc1, bc2 = 1.0 - B1 ** t, 1.0 - B2 ** t
+            grads = {"beta": float(dn(gbeta_buf).sum()), "tau": float(dn(gtau_buf).sum())}
+            for k in ("beta", "tau"):
+                g = grads[k]
+                bt_m[k] = B1 * bt_m[k] + (1 - B1) * g
+                bt_v[k] = B2 * bt_v[k] + (1 - B2) * g * g
+                bt[k] -= args.lr_bt * (bt_m[k] / bc1) / (math.sqrt(bt_v[k] / bc2) + EPS)
+            setbuf(beta_buf, torch.full((G,), bt["beta"]), DT)
+            setbuf(tau_buf, torch.full((G,), bt["tau"]), DT)
+
         # ===== (B) untraced binning seed (no trace yet) =====
         ttnn.synchronize_device(DEV)
         def mu2d_host():     # rebuild mu2d[G,2] on host from the cache columns (for host binning)
@@ -418,7 +554,7 @@ def main():
             r = fn()
             ttnn.end_trace_capture(DEV, tid, cq_id=0)
             return tid, r
-        gfid, (cache, keep, keo, o, color, co) = cap(geom_fwd)
+        gfid, (cache, keep, keo, o, color, co, blist) = cap(geom_fwd)
         ttnn.execute_trace(DEV, gfid, cq_id=0, blocking=False); ttnn.synchronize_device(DEV)
         # conic_t/mu_t depend on conic/mu2d (now geom-trace outputs) + idx_u -> recompute handles in rend traces
         rfid, (C, rc, theta, col_t, oc_t) = cap(rend_fwd)
@@ -427,7 +563,7 @@ def main():
         rbid, (gct, gmt, gcol, goc) = cap(rend_bwd)
         if args.device_scatter:
             sbid, _ = cap(scatter_dev)
-        gbid, gout = cap(geom_bwd)
+        gbid, (gout, dcrest) = cap(geom_bwd)
         ttnn.synchronize_device(DEV)
 
         # ===== (C') verify device loss-grad == host loss-grad on the seeded state =====
@@ -479,12 +615,68 @@ def main():
             img = torch.zeros(cam.H * cam.W, 3).index_copy(0, tmap.gidx, dn(C).reshape(T * 256, 3))
             return metrics.loss_fn(img.reshape(cam.H, cam.W, 3), gt, lambda_ssim=0.2), img
 
+        from spike.mcmc import relocate, op_sigmoid
+        from spike import geometry as _geom
+        def add_sgld_host():
+            """SGLD Langevin noise on means, covariance-shaped, gated to near-dead gaussians (spike.add_sgld_noise)."""
+            o = torch.sigmoid(dn(P["op"]).reshape(-1))
+            s = torch.exp(torch.stack([dn(P[k]).reshape(-1) for k in ("lx", "ly", "lz")], -1))
+            q = torch.stack([dn(P[k]).reshape(-1) for k in ("qw", "qx", "qy", "qz")], -1)
+            L = _geom.quat_to_rotmat(q) * s[:, None, :]                  # cov sqrt [G,3,3]
+            weight = op_sigmoid(1.0 - o) * (args.noise_lr * LR["mx"])    # gate ~1 only for o<~0.005
+            noise = torch.einsum("gij,gj->gi", L, torch.randn(G, 3)) * weight[:, None]
+            mm = torch.stack([dn(P[k]).reshape(-1) for k in ("mx", "my", "mz")], -1) + noise
+            for j, k in enumerate(("mx", "my", "mz")): setbuf(P[k], mm[:, j], DT)
+
+        def do_relocate():
+            """Fixed-count MCMC relocation (host): sync m<-P, relocate dead->live (o->o/n), sync P->m, reset Adam."""
+            m.means3d.data = torch.stack([dn(P["mx"]).reshape(-1), dn(P["my"]).reshape(-1), dn(P["mz"]).reshape(-1)], -1)
+            m.quats.data = torch.stack([dn(P[k]).reshape(-1) for k in ("qw", "qx", "qy", "qz")], -1)
+            m.log_scales.data = torch.stack([dn(P[k]).reshape(-1) for k in ("lx", "ly", "lz")], -1)
+            m.opacity_raw.data = dn(P["op"]).reshape(-1)
+            m.color_dc.data = torch.stack([dn(P[k]).reshape(-1) for k in ("cr", "cg", "cb")], -1)
+            if SHD > 0:
+                for ci in range(3):
+                    for l in range(15):
+                        m.color_rest.data[:, l, ci] = dn(crest[ci][l]).reshape(-1)        # [G,15,3] from device
+            moved, ti = relocate(m, args.dead_thr, offset=0.005)
+            if moved == 0:
+                return 0
+            for j, k in enumerate(("mx", "my", "mz")): setbuf(P[k], m.means3d[:, j], DT)
+            for j, k in enumerate(("qw", "qx", "qy", "qz")): setbuf(P[k], m.quats[:, j], DT)
+            for j, k in enumerate(("lx", "ly", "lz")): setbuf(P[k], m.log_scales[:, j], DT)
+            setbuf(P["op"], m.opacity_raw, DT)
+            for j, k in enumerate(("cr", "cg", "cb")): setbuf(P[k], m.color_dc[:, j], DT)
+            if SHD > 0:                                              # write relocated rest coeffs + reset their Adam
+                for ci in range(3):
+                    for l in range(15):
+                        setbuf(crest[ci][l], m.color_rest[:, l, ci], DT)
+                        for M_ in (crest_mom[ci][l], crest_vom[ci][l]):
+                            mh = dn(M_).reshape(-1); mh[ti] = 0.0; setbuf(M_, mh, DT)
+            if args.fused_adam:                                      # reset device Adam moments at relocated slots
+                for M_ in (mom_m, vom_m):
+                    mh = dn(M_); mh[ti] = 0.0; setbuf(M_, mh, DT)
+            else:
+                for k in PN:
+                    for M_ in (mom[k], vom[k]):
+                        mh = dn(M_).reshape(-1); mh[ti] = 0.0; setbuf(M_, mh, DT)
+            return moved
+
         t_bin = t_scat = 0.0
         t0 = time.perf_counter()
         for it in range(args.iters):
             if args.multi_view:                            # pick a random training view: update camera + GT
                 v = int(torch.randint(len(tr_cams), (1,)))
-                set_cam(tr_cams[v]); gt = tr_imgs[v]
+                set_cam(tr_cams[v])
+                if args.random_bg:                         # composite GT over a random bg; numerator c_B=bg (in-place)
+                    bg = torch.rand(3)
+                    gt = (tr_pm[v] + tr_tr[v] * bg[:, None, None]).permute(1, 2, 0).contiguous()   # [H,W,3]
+                    setbuf(bias, (w_b * bg)[None, None, :].expand(T, 256, 3).contiguous(), BF)      # in-place (trace-safe)
+                else:
+                    gt = tr_imgs[v]
+                if args.device_loss:                       # per-view GT SSIM stats on device (no host loss)
+                    recompute_gt_stats(gt)
+            # device SH colour is now computed inside the geom_fwd trace (no host eval/upload)
             # geom_fwd: only sync when host needs mu2d/keep for binning;
             # device serializes rfid after gfid on the same cq_id=0 automatically
             ttnn.execute_trace(DEV, gfid, cq_id=0, blocking=False)
@@ -537,12 +729,30 @@ def main():
             # geom_bwd: no sync after — copy/adam are ttnn device ops on the same cq_id=0,
             # executed in-order after gbid; loop-end sync covers the final iter
             ttnn.execute_trace(DEV, gbid, cq_id=0, blocking=False)
+            if args.lambda_o:                            # MCMC reg: opacity-L1 grad = lo/G * o(1-o) -> gout[op]
+                o_ = ttnn.sigmoid(P["op"])
+                ttnn.add(gout["op"], ttnn.mul(ttnn.mul(o_, ttnn.add(ttnn.neg(o_), 1.0)), args.lambda_o / G),
+                         output_tensor=gout["op"])
+            if args.lambda_s:                            # MCMC reg: scale-L1 grad = ls/(3G)*exp(log_scale) (mean over Gx3)
+                for k in ("lx", "ly", "lz"):
+                    ttnn.add(gout[k], ttnn.mul(ttnn.exp(P[k]), args.lambda_s / (3.0 * G)), output_tensor=gout[k])
             if args.fused_adam:
                 adam_fused(it + 1)                       # reads gout directly (no gout->gacc copies)
             else:
                 for k in PN:
                     ttnn.copy(gout[k], gacc[k])
                 adam_inplace(it + 1)
+            if SHD > 0:
+                adam_crest(it + 1)                       # device Adam for the SH rest coeffs (color_rest)
+            if args.depth_weight:
+                adam_bt(it + 1)                          # host Adam for the 2 global beta/tau scalars
+            if args.noise_lr:                            # MCMC SGLD: covariance-shaped Langevin noise on near-dead means
+                add_sgld_host()
+            if args.relocate_every and it > 0 and it % args.relocate_every == 0:
+                mv = do_relocate()                       # MCMC: recycle dead slots onto live gaussians
+                if mv:
+                    idx, valid = do_bin()                # positions changed -> re-bin
+                    print(f"   iter {it:4d} relocated {mv}", flush=True)
             if log_it and loss is not None:
                 print(f"   iter {it:4d} loss {float(loss):.4f}")
         ttnn.synchronize_device(DEV)
@@ -558,9 +768,11 @@ def main():
         if args.multi_view:
             @torch.no_grad()
             def eval_psnr(cams_, imgs_, label):
+                if args.random_bg:                        # eval on the STANDARD white bg (benchmark protocol)
+                    setbuf(bias, (w_b * torch.ones(3))[None, None, :].expand(T, 256, 3).contiguous(), BF)
                 ps = []
                 for c, g in zip(cams_, imgs_):
-                    set_cam(c)
+                    set_cam(c)                                # updates the centre buffer -> gfid evals device SH per view
                     ttnn.execute_trace(DEV, gfid, cq_id=0, blocking=False); ttnn.synchronize_device(DEV)
                     do_bin()                                  # binning for this held-out view
                     ttnn.execute_trace(DEV, rfid, cq_id=0, blocking=False); ttnn.synchronize_device(DEV)
@@ -576,6 +788,10 @@ def main():
             m.quats.data = torch.stack([g_("qw"), g_("qx"), g_("qy"), g_("qz")], -1)
             m.log_scales.data = torch.stack([g_("lx"), g_("ly"), g_("lz")], -1)
             m.color_dc.data = torch.stack([g_("cr"), g_("cg"), g_("cb")], -1)
+            if SHD > 0:                                    # SH rest coeffs from the device params
+                for ci in range(3):
+                    for l in range(15):
+                        m.color_rest.data[:, l, ci] = dn(crest[ci][l]).reshape(-1)
             m.opacity_raw.data = g_("op").reshape(m.opacity_raw.shape)
             os.makedirs(os.path.dirname(os.path.abspath(args.save_ply)), exist_ok=True)
             nply = plyio.save_ply(args.save_ply, m)

@@ -87,6 +87,31 @@ def test_softz_depth_order():
     assert (C - s["blue"]).norm() < (C - s["red"]).norm(), C
 
 
+def test_softmin_occludes():
+    s = _setup(); tau = _f(0.8)
+    C = arms.blend_SM(s["w_geo"], s["opacity_raw"], s["depth"], tau, s["color"], s["w_b"], s["c_b"])[0]
+    assert (C - s["red"]).norm() < (C - s["blue"]).norm(), C
+    assert C[0].item() > 0.85 and C[2].item() < 0.15, C
+    # smaller tau -> harder occlusion (monotone)
+    C2 = arms.blend_SM(s["w_geo"], s["opacity_raw"], s["depth"], _f(0.3), s["color"], s["w_b"], s["c_b"])[0]
+    assert C2[0].item() >= C[0].item()
+
+
+def test_softmin_depth_order():
+    s = _setup(); zsw = _f([5.0, 2.0])
+    C = arms.blend_SM(s["w_geo"], s["opacity_raw"], zsw, _f(0.8), s["color"], s["w_b"], s["c_b"])[0]
+    assert (C - s["blue"]).norm() < (C - s["red"]).norm(), C
+
+
+def test_softmin_zgrad():
+    s = _setup(); z = s["depth"].clone().requires_grad_(True)
+    C = arms.blend_SM(s["w_geo"], s["opacity_raw"], z, _f(0.8), s["color"], s["w_b"], s["c_b"])
+    (g,) = torch.autograd.grad(C.sum(), z)
+    assert g.abs().sum() > 0
+    # the FAR gaussian must feel a push (its rho<1, so dL/dz_far != 0)
+    assert g[1].abs().item() > 0
+
+
 if __name__ == "__main__":
     import sys
     sys.exit(_bootstrap.run_module(globals()))

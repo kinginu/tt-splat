@@ -8,7 +8,7 @@ import torch.nn.functional as F
 
 from . import arms, camera as cam_mod, forward, geometry, sh
 
-ARMS = ("A", "B", "C0", "C", "SZ", "RV", "D")
+ARMS = ("A", "B", "C0", "C", "SZ", "RV", "SM", "D")
 
 
 def render(model, cam, arm, k=4.0, blur_eps=0.3, near=0.2, sh_degree=0):
@@ -38,6 +38,8 @@ def render(model, cam, arm, k=4.0, blur_eps=0.3, near=0.2, sh_degree=0):
     elif arm == "C":
         dirs = model.means3d - cam.center[None, :]
         img = arms.blend_C(w_geo, model.opacity_sh, dirs, color, w_b, c_b)
+    elif arm == "SM":
+        img = arms.blend_SM(w_geo, model.opacity_raw, depth, model.softmin_tau, color, w_b, c_b)
     elif arm == "SZ":
         img = arms.blend_SZ(w_geo, model.opacity_raw, depth, model.softz_beta, color, w_b, c_b)
     elif arm == "RV":

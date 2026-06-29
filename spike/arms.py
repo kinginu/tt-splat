@@ -47,6 +47,18 @@ def blend_C(w_geo, opacity_sh, dirs, color, w_b, c_b):
     return _wsr(o[None, :] * w_geo, color, w_b, c_b)
 
 
+def blend_SM(w_geo, opacity_raw, depth, softmin_tau, color, w_b, c_b):
+    """Softmin / Boltzmann depth weight (candidate #2): per-gaussian front-weight
+    rho = exp(-(z - z_ref)/tau), z_ref = detached min(z). tau->0 = front-takes-all (hard
+    occlusion), tau->inf = uniform = arm A. Sort-free (per-gaussian exp = lane-wise), z stays
+    ATTACHED so occlusion produces a z-force (C3). One learnable scalar tau>0."""
+    o = torch.sigmoid(opacity_raw)
+    tau = softmin_tau.clamp(min=1e-3)
+    z_ref = depth.min().detach()                       # front anchor; subgradient detached
+    rho = torch.exp(-(depth - z_ref) / tau)            # [G]
+    return _wsr(o[None, :] * w_geo * rho[None, :], color, w_b, c_b)
+
+
 def blend_SZ(w_geo, opacity_raw, depth, softz_beta, color, w_b, c_b, eps=1e-6):
     """soft-Z visibility prepass (OIT ladder rung 4): per-PIXEL local occlusion, sort-free, GEMM-bound.
 

@@ -1,6 +1,6 @@
 """Oracle: device-style gather-reduce scatter == host torch.index_add (the bin->gaussian scatter).
 
-Current host scatter (m6_resident_traced / m7_sweep_resident):
+Current host scatter (resident_traced / sweep_resident):
     flat = idx.reshape(-1)                                   # [T*K] gaussian id per slot
     g_param = zeros(G,C).index_add_(0, flat, grad_slots.reshape(-1,C))   # sum slots per gaussian
 

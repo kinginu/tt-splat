@@ -4,10 +4,10 @@ NO per-iter param upload / grad download. Verifies the residency mechanic: run N
 + torch Adam). Single view (P=G) to isolate the resident loop from tiling/reduction. Once correct, this is
 the core the full-resident trainer is built on (render/loss/binning wired around it).
 
-Oracle: host geometry (m6_geom_bwd) + torch.optim.Adam, same fixed grads. Host-vs-device param drift.
+Oracle: host geometry (geom_bwd) + torch.optim.Adam, same fixed grads. Host-vs-device param drift.
 
 Run inside the hw container:
-    podman-compose --profile hw run --rm hw python3 tools/m6_resident_core.py
+    podman-compose --profile hw run --rm hw python3 tools/resident_core.py
 """
 import math
 import os
@@ -21,8 +21,8 @@ import torch
 import ttnn
 
 from spike.model import GaussianModel
-import m6_geom_bwd as gbh
-from m6_geom_device import device_fwd_core, device_bwd_core, A, M, S
+import geom_bwd as gbh
+from geom_device import device_fwd_core, device_bwd_core, A, M, S
 
 B1, B2, EPS = 0.9, 0.999, 1e-8
 

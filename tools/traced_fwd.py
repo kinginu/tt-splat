@@ -7,7 +7,7 @@ Single view. Oracle: the untraced device forward (device_fwd_core + gather + ren
 params. PASS = finite + matches.
 
 Run inside the hw container:
-    podman-compose --profile hw run --rm hw python3 tools/m6_traced_fwd.py
+    podman-compose --profile hw run --rm hw python3 tools/traced_fwd.py
 """
 import os
 import sys
@@ -22,7 +22,7 @@ import ttnn
 from spike import data, sh
 from spike.model import GaussianModel
 from m4_train_binned import TileMap, assign_bins, K_POLY
-from m6_geom_device import device_fwd_core, A, M
+from geom_device import device_fwd_core, A, M
 
 C0 = sh.C0
 DEV = None

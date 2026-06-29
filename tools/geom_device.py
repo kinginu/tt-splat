@@ -1,5 +1,5 @@
 """Port the geometry fwd+bwd to ttnn device elementwise (the math is verified host-side in
-m6_geom_bwd.py). This attacks the now-dominant host geometry cost (after bin-every-5 made binning
+geom_bwd.py). This attacks the now-dominant host geometry cost (after bin-every-5 made binning
 non-dominant). Camera is per-view scalar (single-view verify; batch/trace later). Masks (zmask, dmask)
 are read back to host for now (small; replaced by device compares when traced).
 
@@ -7,7 +7,7 @@ Oracle: torch autograd of the same geometry. Verifies conic/mu2d (fwd) and gmean
 (bwd) on silicon.
 
 Run inside the hw container:
-    podman-compose --profile hw run --rm hw python3 tools/m6_geom_device.py
+    podman-compose --profile hw run --rm hw python3 tools/geom_device.py
 """
 import os
 import sys
@@ -20,7 +20,7 @@ import torch
 import ttnn
 
 from spike.model import GaussianModel
-import m6_geom_bwd as gbh           # host reference (forward + autograd oracle in main)
+import geom_bwd as gbh           # host reference (forward + autograd oracle in main)
 
 NEAR, BLUR = 0.2, 0.3
 

@@ -1,9 +1,9 @@
 """Fast-sweep keystone: verify a TRACED geom_fwd that reads the camera from DEVICE BUFFERS (not baked
 python scalars) produces the correct per-view conic/mu2d when the camera buffers are swapped per iter.
 This is the one new risk for the multi-view fast-path sweep (device_fwd_core already accepts tensor camera,
-verified eager in m6_geom_device.run_batched; here we confirm it works inside a trace + buffer swap).
+verified eager in geom_device.run_batched; here we confirm it works inside a trace + buffer swap).
 
-Run:  podman-compose --profile hw run --rm hw python3 tools/m7_cambuf_test.py
+Run:  podman-compose --profile hw run --rm hw python3 tools/cambuf_test.py
 """
 import os
 import sys
@@ -16,7 +16,7 @@ import torch
 import ttnn
 
 from spike.model import GaussianModel
-from m6_geom_device import device_fwd_core, device_fwd, rel
+from geom_device import device_fwd_core, device_fwd, rel
 
 DEV = None
 DT = ttnn.float32

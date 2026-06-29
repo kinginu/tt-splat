@@ -1,5 +1,5 @@
 """Full-pipeline traced trainer (single view, proof + speed). Applies the verified alloc-first
-ordering (docs: trace-allocation hazard SOLVED in m6_traced_fwd) to the WHOLE step: geometry fwd, gather+
+ordering (docs: trace-allocation hazard SOLVED in traced_fwd) to the WHOLE step: geometry fwd, gather+
 render fwd, render bwd + theta bwd, geometry bwd, AND a no-alloc (output_tensor=) Adam -- all traced /
 in-place, so per iter there is ZERO device allocation (only execute_trace + copy_host_to_device + host
 binning/loss/scatter). Resident params updated in place by the Adam ops.
@@ -8,7 +8,7 @@ Single view = the minimal complete traced pipeline (overfits 1 view; proves corr
 the traced per-view step). Multi-view = replicate the 4 traces per view.
 
 Run inside the hw container:
-    podman-compose --profile hw run --rm hw python3 tools/m6_resident_traced.py --res 96 --G 4000 --iters 80
+    podman-compose --profile hw run --rm hw python3 tools/resident_traced.py --res 96 --G 4000 --iters 80
 """
 import argparse
 import math
@@ -26,9 +26,9 @@ import ttnn
 from spike import data, metrics, sh, plyio
 from spike.model import GaussianModel
 from m4_train_binned import TileMap, assign_bins, K_POLY
-from m6_geom_device import device_fwd_core, device_bwd_core, A, M
-from m6_traced_fwd import gather_theta_buf, gather_theta_cols, conic_mu_cols_gather, render_fwd
-from m7_loss_manual import gauss_1d, band_matrix, filt as hfilt, C1 as L_C1, C2 as L_C2, LAMBDA as L_LAM
+from geom_device import device_fwd_core, device_bwd_core, A, M
+from traced_fwd import gather_theta_buf, gather_theta_cols, conic_mu_cols_gather, render_fwd
+from loss_manual import gauss_1d, band_matrix, filt as hfilt, C1 as L_C1, C2 as L_C2, LAMBDA as L_LAM
 from m9_scatter_oracle import build_inv
 from bin_device import bin_to_buffers, build_inv_device, make_bin_ctx
 

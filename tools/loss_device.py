@@ -1,5 +1,5 @@
 """Device loss gradient dL/dimg on the Blackhole, verified vs the host oracle
-(tools/m7_loss_manual.py, itself matched to the training loss_fn). Computes gC = dL/dimg for
+(tools/loss_manual.py, itself matched to the training loss_fn). Computes gC = dL/dimg for
 (1-λ)·L1 + λ·(1-SSIM) entirely on device so the resident trainer never round-trips C/gC through host.
 
 Design: the SSIM 11×11 separable Gaussian is banded-matrix GEMMs (filt = Mh·x·Mwᵀ, backward = Mhᵀ·g·Mw);
@@ -7,7 +7,7 @@ y (gt) is constant per view so its filtered maps (muy, muy2, sy) are precomputed
 Only the grad is needed (not the loss value) → no device reduction; the 1/Ns and 1/N scales are host scalars.
 
 Run inside the hw container (needs the device free):
-    podman-compose --profile hw run --rm hw python3 tools/m7_loss_device.py --res 96
+    podman-compose --profile hw run --rm hw python3 tools/loss_device.py --res 96
 """
 import argparse
 import os
@@ -20,7 +20,7 @@ sys.path.insert(0, HERE)
 import torch
 import ttnn
 
-from m7_loss_manual import gauss_1d, band_matrix, ssim_fwd, loss_manual, C1, C2, LAMBDA
+from loss_manual import gauss_1d, band_matrix, ssim_fwd, loss_manual, C1, C2, LAMBDA
 
 DEV = None
 DT = ttnn.float32
@@ -58,7 +58,7 @@ def main():
     _, g_ref = loss_manual(x_h, y_h, Mh, Mw)     # [3,H,W]
 
     # ---- precompute y-only (constant) maps on host, upload (muy, muy2, sy) ----
-    from m7_loss_manual import filt as hfilt
+    from loss_manual import filt as hfilt
     muy = hfilt(y_h, Mh, Mw)
     muy2 = muy * muy
     sy = hfilt(y_h * y_h, Mh, Mw) - muy2

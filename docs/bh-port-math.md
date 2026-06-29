@@ -211,7 +211,7 @@ These are also matrix expressions, and being O(G) they never dominate. So the fu
 gC →(WSR bwd: transposed GEMMs)→ gw →(poly bwd)→ gQ →(Φᵀ GEMM)→ gθ →(geometry Jacobian, O(G))→ g(params) → Adam
 ```
 
-> Device geometry fwd/bwd verified on silicon: `tools/m5_geom_device.py`, `tools/m6_geom_bwd.py`
+> Device geometry fwd/bwd verified on silicon: `tools/m5_geom_device.py`, `tools/geom_bwd.py`
 > (the Jacobian, rel ~5e-7).
 
 ---

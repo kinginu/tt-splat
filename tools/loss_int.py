@@ -3,7 +3,7 @@ typecast) from the trainer, since the full trainer hung. Runs the exact loss_gra
 then (2) inside a TRACE, each compared to the host oracle. Pinpoints whether a specific op or trace-capture
 is the hang.
 
-Run:  podman-compose --profile hw run --rm hw python3 tools/m7_loss_int.py --res 96
+Run:  podman-compose --profile hw run --rm hw python3 tools/loss_int.py --res 96
 """
 import argparse
 import os
@@ -18,7 +18,7 @@ import ttnn
 
 from spike import data
 from m4_train_binned import TileMap
-from m7_loss_manual import gauss_1d, band_matrix, filt as hfilt, loss_manual, C1 as L_C1, C2 as L_C2, LAMBDA as L_LAM
+from loss_manual import gauss_1d, band_matrix, filt as hfilt, loss_manual, C1 as L_C1, C2 as L_C2, LAMBDA as L_LAM
 
 DEV = None
 DT = ttnn.float32

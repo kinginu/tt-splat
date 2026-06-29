@@ -3,12 +3,12 @@ per iter the forward (geometry -> activations -> gather -> binned render) and ba
 theta-bwd -> scatter[host] -> geometry-bwd) and Adam all run on device, with the ONLY host work being
 binning indices (every-N) + the loss gradient (small image round-trip). Built from the verified pieces:
 device_fwd_core/device_bwd_core (geometry), the gather+theta build, the m4_train_step render fwd/bwd,
-and the m6_resident_core device Adam. Per-view loop (no tiling); UNTRACED first (correctness), traces later.
+and the resident_core device Adam. Per-view loop (no tiling); UNTRACED first (correctness), traces later.
 
-Oracle: same held-out PSNR as tools/m4_train_binned.py / m6_train_manual.py.
+Oracle: same held-out PSNR as tools/m4_train_binned.py / train_manual.py.
 
 Run inside the hw container:
-    podman-compose --profile hw run --rm hw python3 tools/m6_resident_trainer.py --res 96 --G 4000 --iters 60
+    podman-compose --profile hw run --rm hw python3 tools/resident_trainer.py --res 96 --G 4000 --iters 60
 """
 import argparse
 import math
@@ -26,8 +26,8 @@ import ttnn
 from spike import data, metrics, sh
 from spike.model import GaussianModel
 from m4_train_binned import TileMap, assign_bins, K_POLY
-from m6_geom_device import device_fwd_core, device_bwd_core, A, M, S
-from m6_resident_core import adam_dev
+from geom_device import device_fwd_core, device_bwd_core, A, M, S
+from resident_core import adam_dev
 
 C0 = sh.C0
 DEV = None

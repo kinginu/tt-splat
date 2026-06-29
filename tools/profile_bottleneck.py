@@ -2,7 +2,7 @@
 high-res config (res=800). Confirms WHERE the ~host-bound per-iter time goes before running the
 full sweep, so the fix targets the real limiter (host compute vs host<->device transfers).
 
-Stages timed (= the 6 calls in m6_train_manual.train_step_manual):
+Stages timed (= the 6 calls in train_manual.train_step_manual):
   1 geom+gather  fwd_manual         host (binning runs only on bins=None iters -> split reported)
   2 render fwd   FastRender.forward device  (further split: copy-in / exec+sync / copy-out)
   3 loss+bwd     host autograd on the image leaf
@@ -14,7 +14,7 @@ Single fixed view (stochastic 1/iter in the sweep; the per-iter view does not ch
 bins recomputed every --bin-every iters (the shipped default 5); bin-iters vs reuse-iters reported apart.
 
 Run inside the hw container:
-    podman-compose --profile hw run --rm hw python3 tools/m6_profile_bottleneck.py --res 800 --G 1000
+    podman-compose --profile hw run --rm hw python3 tools/profile_bottleneck.py --res 800 --G 1000
 """
 import argparse
 import os
@@ -34,8 +34,8 @@ from spike.model import GaussianModel
 from spike.train import DEFAULT_LR
 import m4_train_binned as mtb
 from m4_train_binned import TileMap, dn
-import m6_faststep as fs
-from m6_operands_manual import fwd_manual, bwd_manual
+import faststep as fs
+from operands_manual import fwd_manual, bwd_manual
 
 
 def _t():
@@ -142,7 +142,7 @@ def main():
 
         # warm up (JIT + FastRender capture)
         tw = _t()
-        from m6_train_manual import train_step_manual
+        from train_manual import train_step_manual
         _, bins = train_step_manual(model, cams, gts, tmap, args.K, opt, None)
         fr = fs._FR[(len(cams) * T, args.K)]
         print(f"   warm-up (JIT+capture): {_t()-tw:.0f}s", flush=True)

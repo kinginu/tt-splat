@@ -40,8 +40,8 @@ from spike.render import render as cpu_render
 from spike.train import DEFAULT_LR
 import m4_train_binned as mtb
 from m4_train_binned import TileMap, render_binned_device
-import m6_faststep as fs
-from m6_train_manual import train_step_manual
+import faststep as fs
+from train_manual import train_step_manual
 
 
 def _auto_k(G):

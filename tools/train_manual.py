@@ -1,12 +1,12 @@
 """NO-AUTOGRAD trainer. Removes the torch-autograd cost (the host cap)
-entirely: operands fwd + manual bwd (m6_operands_manual, verified) on host, render fwd+bwd via FastRender
-(device, traced, batched, m6_faststep). The ONLY autograd is a tiny graph on the per-iter image leaf to
+entirely: operands fwd + manual bwd (operands_manual, verified) on host, render fwd+bwd via FastRender
+(device, traced, batched, faststep). The ONLY autograd is a tiny graph on the per-iter image leaf to
 get dL/dC (loss+SSIM grad). All param grads are set manually; opt.step() applies them.
 
 Oracle: same held-out PSNR as tools/m4_train_binned.py. Metric: ms/it vs partial-BH.
 
 Run inside the hw container:
-    podman-compose --profile hw run --rm hw python3 tools/m6_train_manual.py --compare --res 128 --G 8000 --K 256
+    podman-compose --profile hw run --rm hw python3 tools/train_manual.py --compare --res 128 --G 8000 --K 256
 """
 import argparse
 import os
@@ -25,8 +25,8 @@ from spike import data, metrics
 from spike.model import GaussianModel
 import m4_train_binned as mtb
 from m4_train_binned import TileMap, render_binned_device
-import m6_faststep as fs
-from m6_operands_manual import fwd_manual, bwd_manual
+import faststep as fs
+from operands_manual import fwd_manual, bwd_manual
 
 
 def train_step_manual(model, cams, gts, tmap, K, opt, bins=None):

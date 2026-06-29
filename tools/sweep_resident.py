@@ -1,6 +1,6 @@
 """FAST-PATH SWEEP runner: multi-view stochastic training on the full-resident + device-loss path
 (the 2.74x trainer), with camera-as-device-buffers (one trace set serves all views, keystone-verified in
-m7_cambuf_test) + per-view gt resident on device + held-out eval + .ply. This is bh_native_sweep's
+cambuf_test) + per-view gt resident on device + held-out eval + .ply. This is bh_native_sweep's
 methodology on the FAST trainer instead of the host-bound hybrid.
 
 Per iter: pick a train view -> set camera buffers + copy that view's gt into y_d (device) -> geom-fwd
@@ -8,7 +8,7 @@ trace -> (every-N) host binning -> rend-fwd trace -> device loss-grad trace (gC 
 trace -> host scatter -> geom-bwd trace -> device Adam. Eval renders the test split (traces, no bwd).
 
 Run (one G per process):
-    podman-compose --profile hw run --rm hw python3 tools/m7_sweep_resident.py --G 1000 --iters 3000
+    podman-compose --profile hw run --rm hw python3 tools/sweep_resident.py --G 1000 --iters 3000
 """
 import argparse
 import math
@@ -29,10 +29,10 @@ from spike import data, metrics, sh, plyio
 from spike.model import GaussianModel
 from spike.train import DEFAULT_LR
 from m4_train_binned import TileMap, assign_bins, K_POLY
-from m6_geom_device import device_fwd_core, device_bwd_core, A, M
-from m6_traced_fwd import gather_theta_buf
-from m6_resident_traced import render_bwd, theta_bwd, PN, B1, B2, EPS
-from m7_loss_manual import gauss_1d, band_matrix, C1 as L_C1, C2 as L_C2, LAMBDA as L_LAM
+from geom_device import device_fwd_core, device_bwd_core, A, M
+from traced_fwd import gather_theta_buf
+from resident_traced import render_bwd, theta_bwd, PN, B1, B2, EPS
+from loss_manual import gauss_1d, band_matrix, C1 as L_C1, C2 as L_C2, LAMBDA as L_LAM
 
 C0 = sh.C0
 DEV = None
@@ -144,8 +144,8 @@ def main():
     DEV = ttnn.open_device(device_id=0, trace_region_size=512 * 1024 * 1024)
     try:
         CG = ttnn.CoreGrid(x=11, y=10)
-        import m6_resident_traced as mrt
-        mrt.CG = CG                     # render_bwd/theta_bwd use m6_resident_traced's module-global CG
+        import resident_traced as mrt
+        mrt.CG = CG                     # render_bwd/theta_bwd use resident_traced's module-global CG
         # ===== (A) buffers =====
         P = dict(mx=u(m.means3d[:, 0]), my=u(m.means3d[:, 1]), mz=u(m.means3d[:, 2]),
                  qw=u(m.quats[:, 0]), qx=u(m.quats[:, 1]), qy=u(m.quats[:, 2]), qz=u(m.quats[:, 3]),

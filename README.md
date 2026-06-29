@@ -248,7 +248,7 @@ NoC-atomic scatter above — which is exactly why that custom kernel is the next
 
 - `spike/` — the matrix-native PyTorch reference (camera, geometry, SH, poly-splat forward, analytic backward,
   WSR, MCMC) + tests. **The oracle.**
-- `tools/` — Blackhole (ttnn) kernels and the device trainer (`m6_resident_traced.py`) and its
+- `tools/` — Blackhole (ttnn) kernels and the device trainer (`resident_traced.py`) and its
   supporting bricks, plus the GPU-box benchmark drivers (the gsplat baseline).
 - `docs/` — benchmark results, the rendering comparisons, and
   **[`docs/bh-port-math.md`](docs/bh-port-math.md)** (the full math of the GEMM rewrite).

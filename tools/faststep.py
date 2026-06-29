@@ -11,7 +11,7 @@ geometry to the params for free. No new device backward, no manual scatter.
 Oracle: same held-out PSNR as tools/m4_train_binned.py. Metric: ms/it traced-batched vs untraced.
 
 Run inside the hw container:
-    podman-compose --profile hw run --rm hw python3 tools/m6_faststep.py --compare --res 128 --G 8000 --K 256
+    podman-compose --profile hw run --rm hw python3 tools/faststep.py --compare --res 128 --G 8000 --K 256
 """
 import argparse
 import os
@@ -29,7 +29,7 @@ from spike import data, metrics
 from spike.model import GaussianModel
 import m4_train_binned as mtb
 from m4_train_binned import TileMap, _operands, up, dn, T3, render_binned_device
-from m6_operands_batched import operands_batched
+from operands_batched import operands_batched
 
 DEV = None
 CG = None

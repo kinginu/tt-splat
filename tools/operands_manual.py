@@ -1,5 +1,5 @@
 """FULL manual (no-autograd) operands fwd+bwd on host, verified vs autograd. Removes the
-torch-autograd cost that the breakdown showed caps the trainer. Chain: geometry (m6_geom_bwd, verified)
+torch-autograd cost that the breakdown showed caps the trainer. Chain: geometry (geom_bwd, verified)
 + color/opacity activations + binning + gather + theta_u build, with a hand-written backward composing
 geometry-bwd + theta-build-bwd + gather scatter + activation grads. Once verified, plugs into a
 no-autograd trainer with FastRender (device render) -- every gradient manual, no torch graph.
@@ -7,7 +7,7 @@ no-autograd trainer with FastRender (device render) -- every gradient manual, no
 Oracle: torch autograd of the same forward (per-param grads). Host-only.
 
 Run (no device):
-    podman run --rm -v $PWD:/workspace -w /workspace tt-splat:dev python3 tools/m6_operands_manual.py
+    podman run --rm -v $PWD:/workspace -w /workspace tt-splat:dev python3 tools/operands_manual.py
 """
 import os
 import sys
@@ -21,7 +21,7 @@ import torch
 from spike import data, forward, geometry, sh
 from spike.model import GaussianModel
 from m4_train_binned import TileMap, assign_bins, theta_u_gathered, K_POLY
-import m6_geom_bwd as gb
+import geom_bwd as gb
 
 C0 = sh.C0
 

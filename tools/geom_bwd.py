@@ -6,7 +6,7 @@ conic[G,3], mu2d[G,2]; backward: (gconic, gmu2d) -> (gmeans, gquats, glog_scales
 Oracle: torch autograd of the same forward. Host-only.
 
 Run (no device):
-    podman run --rm -v $PWD:/workspace -w /workspace tt-splat:dev python3 tools/m6_geom_bwd.py
+    podman run --rm -v $PWD:/workspace -w /workspace tt-splat:dev python3 tools/geom_bwd.py
 """
 import os
 import sys

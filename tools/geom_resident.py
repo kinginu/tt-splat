@@ -1,5 +1,5 @@
 """GeomDevice -- traced, resident device geometry fwd+bwd (batched over all views, P=N*G).
-Wraps the verified device_fwd_core/device_bwd_core (m6_geom_device) in persistent buffers + two ttnn
+Wraps the verified device_fwd_core/device_bwd_core (geom_device) in persistent buffers + two ttnn
 traces (fwd, bwd). Params/camera live in device buffers (camera set once; params copied each iter); fwd
 trace -> conic/mu2d (device); bwd trace -> per-gaussian-view grads. This moves the now-dominant host
 geometry on-device and traces it (dispatch collapse).
@@ -7,7 +7,7 @@ geometry on-device and traces it (dispatch collapse).
 Oracle: torch autograd (per view, accumulated). Verifies traced output + times traced vs untraced.
 
 Run inside the hw container:
-    podman-compose --profile hw run --rm hw python3 tools/m6_geom_resident.py
+    podman-compose --profile hw run --rm hw python3 tools/geom_resident.py
 """
 import os
 import sys
@@ -21,8 +21,8 @@ import torch
 import ttnn
 
 from spike.model import GaussianModel
-import m6_geom_bwd as gbh
-from m6_geom_device import device_fwd_core, device_bwd_core, device_fwd, device_bwd, _cams, rel
+import geom_bwd as gbh
+from geom_device import device_fwd_core, device_bwd_core, device_fwd, device_bwd, _cams, rel
 
 NEAR = 0.2
 
@@ -206,7 +206,7 @@ def main():
         print(f"     traced + set_params copies : {tt*1e3:.1f} ms")
         print(f"     traced, params RESIDENT    : {tr*1e3:.1f} ms  (no 10 param copies; 5 grad copies remain)")
         print(f"     traced, PURE replay        : {tp*1e3:.1f} ms  (no host copies at all)")
-        print(f"   host geometry (m6_geom_bwd, 6 views) reference ~45 ms")
+        print(f"   host geometry (geom_bwd, 6 views) reference ~45 ms")
     finally:
         ttnn.close_device(dev)
 

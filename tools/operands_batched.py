@@ -8,7 +8,7 @@ operands the per-view loop produces.
 Oracle: m4_train_binned._operands looped per view (forward values + autograd grads). Host-only.
 
 Run (no device):
-    podman run --rm -v $PWD:/workspace -w /workspace tt-splat:dev python3 tools/m6_operands_batched.py
+    podman run --rm -v $PWD:/workspace -w /workspace tt-splat:dev python3 tools/operands_batched.py
 """
 import os
 import sys

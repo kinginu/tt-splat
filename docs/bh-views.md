@@ -28,7 +28,7 @@ our BH render — gsplat can't be re-rendered here, no gsplat .ply / no GPU on t
 |---|---|
 | scene / res | playroom, trained 1264×832 (downscale 1) |
 | model | 100,000 gaussians, `outputs/bench/playroom_G100k_mv.ply` (gitignored) |
-| training | `m6_resident_traced --multi-view --device-binning`, 196 train / 29 held-out, 6000 iters |
+| training | `resident_traced --multi-view --device-binning`, 196 train / 29 held-out, 6000 iters |
 | **held-out PSNR** | **17.37 dB** (train 17.08 → generalizes) |
 | renderer | OUR matrix-native render (poly-splat `(1−Q/k)₊²` + weighted-sum blend), CPU binned (`tools/bh_views.py`) |
 

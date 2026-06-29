@@ -6,7 +6,7 @@ backward = M_hᵀ g M_w). No autograd. Verified against (a) pytorch_msssim loss_
 Why GEMM-form: the 11×11 separable Gaussian on a fixed-size image is a banded [Hout×Hin] matrix applied
 along H then a [Wout×Win] along W — both GEMMs (matrix engine), no conv2d needed on device.
 
-Run (CPU, no device):  podman-compose --profile hw run --rm hw python3 tools/m7_loss_manual.py
+Run (CPU, no device):  podman-compose --profile hw run --rm hw python3 tools/loss_manual.py
 """
 import os
 import sys

@@ -49,6 +49,8 @@ class GaussianModel(nn.Module):
         self.depth_tau = nn.Parameter(torch.tensor(depth_tau, dtype=dtype, device=device))
         self.softz_beta = nn.Parameter(torch.tensor(4.0, dtype=dtype, device=device))  # arm SZ gate sharpness
         self.softmin_tau = nn.Parameter(torch.tensor(2.0, dtype=dtype, device=device))  # arm SM temperature
+        self.bp_tau = nn.Parameter(torch.tensor(2.0, dtype=dtype, device=device))   # arm BP temperature
+        self.e_tau = nn.Parameter(torch.tensor(1.0, dtype=dtype, device=device))   # arm E soft surrogate temperature
         self.register_buffer("c_b", torch.ones(3, dtype=dtype, device=device))         # white bg
 
     @property
@@ -94,4 +96,6 @@ class GaussianModel(nn.Module):
             {"params": [self.depth_beta, self.depth_tau], "lr": lr["depth"]},
             {"params": [self.softz_beta], "lr": lr["depth"]},
             {"params": [self.softmin_tau], "lr": lr["depth"]},
+            {"params": [self.bp_tau], "lr": lr["depth"]},
+            {"params": [self.e_tau], "lr": lr["depth"]},
         ]

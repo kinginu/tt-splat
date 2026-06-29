@@ -59,6 +59,20 @@ def blend_SM(w_geo, opacity_raw, depth, softmin_tau, color, w_b, c_b):
     return _wsr(o[None, :] * w_geo * rho[None, :], color, w_b, c_b)
 
 
+def blend_BP(w_geo, opacity_raw, depth, bp_tau, color, w_b, c_b, eps=1e-4):
+    """Pairwise soft-occlusion GEMM ('arm B′', candidate #5): per-gaussian transmittance
+    rho_i = exp(-(S beta)_i), S_ij = sigmoid((z_i - z_j)/tau) (j in front of i, diag zeroed),
+    beta_j = -log(1-o_j). tau->0 = exact alpha-transmittance Prod(1-o_j). Sort-free (S = [G,G]
+    GEMM, exp lane-wise); z ATTACHED (C3). One learnable scalar tau>0."""
+    o = torch.sigmoid(opacity_raw)
+    tau = bp_tau.clamp(min=1e-3)
+    beta = -torch.log1p(-(o.clamp(max=1.0 - eps)))                 # [G]
+    S = torch.sigmoid((depth[:, None] - depth[None, :]) / tau)     # [G,G]
+    S = S * (1.0 - torch.eye(S.shape[0], dtype=S.dtype, device=S.device))   # zero diagonal
+    rho = torch.exp(-(S @ beta))                                   # [G]
+    return _wsr(o[None, :] * w_geo * rho[None, :], color, w_b, c_b)
+
+
 def blend_SZ(w_geo, opacity_raw, depth, softz_beta, color, w_b, c_b, eps=1e-6):
     """soft-Z visibility prepass (OIT ladder rung 4): per-PIXEL local occlusion, sort-free, GEMM-bound.
 
@@ -77,6 +91,45 @@ def blend_SZ(w_geo, opacity_raw, depth, softz_beta, color, w_b, c_b, eps=1e-6):
     zstar = (W0 @ z[:, None]) / den0                           # [P,1] Σwz/Σw, per-pixel front depth
     h = torch.sigmoid(-softz_beta * (z[None, :] - zstar))      # [P,G] front wins
     return _wsr(W0 * h, color, w_b, c_b)
+
+
+def blend_E(w_geo, opacity_raw, depth, e_tau, color, w_b, c_b, S=8, gen=None):
+    """Stochastic transparency / Gumbel-softmin (candidate #8, 'arm E'). Forward = stochastic-hard
+    (Bernoulli keep prob alpha_pg, nearest-kept argmin, mean of S samples) = unbiased alpha
+    compositing with crisp occlusion edges. Backward via softmin surrogate (STE): value=hard,
+    grad=soft. z attached through soft path (C3). Sort-free: argmin is per-pixel, not global."""
+    o = torch.sigmoid(opacity_raw)
+    alpha = (o[None, :] * w_geo).clamp(1e-6, 1.0 - 1e-4)        # [P,G]
+
+    # Hard (unbiased, no grad): stochastic argmin
+    P, G = alpha.shape
+    results = []
+    with torch.no_grad():
+        for _ in range(S):
+            if gen is not None:
+                noise = torch.rand(P, G, dtype=alpha.dtype, device=alpha.device, generator=gen)
+            else:
+                noise = torch.rand(P, G, dtype=alpha.dtype, device=alpha.device)
+            keep = (noise < alpha).float()                         # [P,G] Bernoulli samples
+            d_masked = depth.unsqueeze(0).expand(P, G).clone()
+            d_masked = d_masked.masked_fill(keep == 0, float("inf"))
+            winner = d_masked.argmin(dim=1)                       # [P]
+            all_inf = d_masked.isinf().all(dim=1)                 # [P]
+            C_s = color[winner]                                   # [P,3]
+            if all_inf.any():
+                C_s = C_s.clone()
+                C_s[all_inf] = c_b.to(C_s.dtype)
+            results.append(C_s)
+    hard = torch.stack(results).mean(0)                           # [P,3]
+
+    # Soft (differentiable, z attached): softmin surrogate
+    tau = e_tau.clamp(min=1e-3)
+    z_ref = depth.min().detach()
+    rho = torch.exp(-(depth - z_ref) / tau)                       # [G]
+    soft = _wsr(o[None, :] * w_geo * rho[None, :], color, w_b, c_b)   # [P,3]
+
+    # STE: value = hard (unbiased), grad = soft (differentiable)
+    return soft + (hard - soft).detach()                          # [P,3]
 
 
 def blend_RV(w_geo, opacity_raw, color, w_b, c_b, eps=1e-6):

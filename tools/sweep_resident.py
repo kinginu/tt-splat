@@ -7,10 +7,14 @@ Per iter: pick a train view -> set camera buffers + copy that view's gt into y_d
 trace -> (every-N) host binning -> rend-fwd trace -> device loss-grad trace (gC on device) -> rend-bwd
 trace -> host scatter -> geom-bwd trace -> device Adam. Eval renders the test split (traces, no bwd).
 
+Outputs conform to the canonical contract: eval.json (evalcard), bh_fast_rollup.json, summary.txt,
+and GT|render held-out panels on full runs.
+
 Run (one G per process):
     podman-compose --profile hw run --rm hw python3 tools/sweep_resident.py --G 1000 --iters 3000
 """
 import argparse
+import json
 import math
 import os
 import sys
@@ -25,7 +29,7 @@ import torch
 import ttnn
 from PIL import Image
 
-from spike import data, metrics, sh, plyio
+from spike import data, metrics, sh, plyio, evalcard
 from spike.model import GaussianModel
 from spike.train import DEFAULT_LR
 from m4_train_binned import TileMap, assign_bins, K_POLY
@@ -65,6 +69,14 @@ def _save_img(path, img):
     Image.fromarray(arr).save(path)
 
 
+def _save_panel(path, gt, render):
+    """Save GT (left) | render (right) side-by-side panel as uint8 PNG."""
+    gt_arr = (gt.clamp(0, 1).detach().cpu().numpy() * 255 + 0.5).astype(np.uint8)
+    rend_arr = (render.clamp(0, 1).detach().cpu().numpy() * 255 + 0.5).astype(np.uint8)
+    panel = np.concatenate([gt_arr, rend_arr], axis=1)
+    Image.fromarray(panel).save(path)
+
+
 def main():
     global DEV, CG
     ap = argparse.ArgumentParser()
@@ -77,7 +89,11 @@ def main():
     ap.add_argument("--bin-every", type=int, default=5)
     ap.add_argument("--n-train", type=int, default=100)
     ap.add_argument("--out", default="outputs/bh_sweep_fast")
+    ap.add_argument("--method", default="bh_fast_resident",
+                    help="algo label for canonical output paths (eval.json/rollup/panels)")
     ap.add_argument("--no-ply", action="store_true")
+    ap.add_argument("--no-views", action="store_true",
+                    help="skip GT|render panel saves even on full runs")
     # MCMC density control (ported from spike/mcmc.py). 0 disables.
     ap.add_argument("--lam-o", type=float, default=0.01)        # opacity-L1 reg
     ap.add_argument("--lam-s", type=float, default=0.01)        # scale-L1 reg (kills runaway-scale spikes)
@@ -135,6 +151,12 @@ def main():
         m = GaussianModel(G, extent=1.5, seed=0)
     Ntr = len(tr_c)
     print(f"[fast] {args.scene_name} G={G} K={K} res={H}x{W} iters={args.iters} | {Ntr} train, {len(te_c)} test", flush=True)
+
+    # Canonical paths for eval.json / panels / rollup (uses same res as training)
+    paths = evalcard.run_paths(args.method, args.scene_name, G, res,
+                               iters=args.iters, K=K, root=args.out)
+    os.makedirs(paths["dir"], exist_ok=True)
+
     LR = {**{k: DEFAULT_LR["means"] for k in ("mx", "my", "mz")},
           **{k: DEFAULT_LR["quats"] for k in ("qw", "qx", "qy", "qz")},
           **{k: DEFAULT_LR["scales"] for k in ("lx", "ly", "lz")},
@@ -177,7 +199,7 @@ def main():
         # loss consts
         g1d = gauss_1d(); Mh_np, Mw_np = band_matrix(H, g1d), band_matrix(W, g1d)
         Hout, Win = Mh_np.shape[0], Mw_np.shape[1]
-        Ns_loss = float(3 * Mh_np.shape[0] * Mw_np.shape[0]); N_loss = float(3 * H * W)
+        Ns_loss = float(3 * Mh_np.shape[0] * Mh_np.shape[0]); N_loss = float(3 * H * W)
         Mh_b = u(Mh_np.unsqueeze(0).expand(3, *Mh_np.shape).contiguous())
         MwT_b = u(Mw_np.t().unsqueeze(0).expand(3, Win, Mw_np.shape[0]).contiguous())
         MhT_b = u(Mh_np.t().unsqueeze(0).expand(3, Mh_np.shape[1], Hout).contiguous())
@@ -191,6 +213,17 @@ def main():
 
         def setcam(camlist, v):
             cam = camlist[v]
+            Rv = [[float(cam.R_v[i, j]) for j in range(3)] for i in range(3)]
+            tv = [float(cam.t_v[i]) for i in range(3)]
+            for i in range(3):
+                for j in range(3):
+                    ttnn.copy_host_to_device_tensor(uh(torch.full((G,), Rv[i][j])), Rvb[i][j])
+                ttnn.copy_host_to_device_tensor(uh(torch.full((G,), tv[i])), tvb[i])
+            for buf, val in ((fxb, cam.fx), (fyb, cam.fy), (cxb, cam.cx), (cyb, cam.cy)):
+                ttnn.copy_host_to_device_tensor(uh(torch.full((G,), float(val))), buf)
+
+        def _setcam_direct(cam):
+            """Set camera buffers from a camera object directly (not from a list)."""
             Rv = [[float(cam.R_v[i, j]) for j in range(3)] for i in range(3)]
             tv = [float(cam.t_v[i]) for i in range(3)]
             for i in range(3):
@@ -470,21 +503,15 @@ def main():
         print(f"[fast] {args.scene_name} G={G}: {it_s} it/s | holdout {ho_p:.2f}dB/{ho_s:.4f} | "
               f"train {tr_p:.2f}dB | {train_s/60:.1f} min", flush=True)
 
-        # save renders + ply + metrics
+        # Diagnostic black-bg render (shows empty-space fill); kept as-is
         rd = os.path.join(out_dir, "renders"); os.makedirs(rd, exist_ok=True)
-        for i in range(min(4, len(te_c))):
-            run_geom_bin(te_c, i)
-            ttnn.execute_trace(DEV, rfid, cq_id=0, blocking=False); ttnn.synchronize_device(DEV)
-            img = torch.zeros(H * W, 3).index_copy(0, tmap.gidx, dn(C).reshape(T * 256, 3)).reshape(H, W, 3)
-            _save_img(os.path.join(rd, f"test_{i:02d}_render.png"), img)
-            _save_img(os.path.join(rd, f"test_{i:02d}_gt.png"), te_i[i])
-        # BLACK-bg render (c_B=black, w_b kept): reproduces the viewer symptom -> shows empty-space fill.
         setbuf(bias, torch.zeros(T, 256, 3), BF)
         run_geom_bin(te_c, 0)
         ttnn.execute_trace(DEV, rfid, cq_id=0, blocking=False); ttnn.synchronize_device(DEV)
         imgb = torch.zeros(H * W, 3).index_copy(0, tmap.gidx, dn(C).reshape(T * 256, 3)).reshape(H, W, 3)
         _save_img(os.path.join(rd, "test_00_black.png"), imgb)
-        # pull params back into the model for ply
+
+        # pull params back into the model for ply / evalcard
         with torch.no_grad():
             m.means3d.copy_(torch.stack([dn(P["mx"]).reshape(-1), dn(P["my"]).reshape(-1), dn(P["mz"]).reshape(-1)], -1))
             m.quats.copy_(torch.stack([dn(P["qw"]).reshape(-1), dn(P["qx"]).reshape(-1), dn(P["qy"]).reshape(-1), dn(P["qz"]).reshape(-1)], -1))
@@ -493,12 +520,105 @@ def main():
             m.opacity_raw.copy_(dn(P["op"]).reshape(-1))
         ply_path = ""
         if not args.no_ply:
-            ply_path = os.path.join(out_dir, "model.ply"); plyio.save_ply(ply_path, m)
+            ply_path = paths["ply"]; plyio.save_ply(ply_path, m)
         with open(os.path.join(out_dir, "metrics.txt"), "w") as f:
             f.write(f"scene {args.scene_name} G {G} K {K} res {res} iters {args.iters}\n")
             f.write(f"it_per_s {it_s}\nholdout_psnr {ho_p:.2f}\nholdout_ssim {ho_s:.4f}\ntrain_psnr {tr_p:.2f}\n")
             f.write(f"train_min {train_s/60:.1f}\nply {ply_path}\ndevice blackhole-fast-resident-deviceloss\n")
         print(f"   saved -> {out_dir}/", flush=True)
+
+        # ===== (E) canonical outputs: eval.json, panels, rollup.json, summary.txt =====
+
+        # Eval card (blender only — COLMAP has no per-pixel alpha for the two-bg trick)
+        perc = {}
+        if not args.colmap:
+            _, te_rgba = data.load_blender(args.scene, "test", res=res, keep_alpha=True)
+
+            def rfn_eval(mdl, cam, b):
+                """Device render with constant bg b for evalcard two-bg perceptual metrics."""
+                setbuf(bias, torch.full((T, 256, 3), w_b * float(b)), BF)
+                _setcam_direct(cam)
+                ttnn.execute_trace(DEV, gfid, cq_id=0, blocking=False)
+                ttnn.synchronize_device(DEV)
+                idx_e, valid_e = assign_bins(dn(mu2d), dn(keep).reshape(-1) > 0.5, tmap, 1, K)
+                setbuf(idx_u, idx_e.to(torch.int32).reshape(T, K), ttnn.uint32, ttnn.ROW_MAJOR_LAYOUT)
+                setbuf(valid6, valid_e[:, None, :].expand(T, 6, K).float())
+                setbuf(vf, valid_e[..., None].float())
+                ttnn.execute_trace(DEV, rfid, cq_id=0, blocking=False)
+                ttnn.synchronize_device(DEV)
+                return torch.zeros(H * W, 3).index_copy(0, tmap.gidx, dn(C).reshape(T * 256, 3)).reshape(H, W, 3)
+
+            try:
+                card = evalcard.build(m, te_c, te_rgba, rfn_eval, method=args.method,
+                                      scene=args.scene_name, G=G, res=res, iters=args.iters, K=K,
+                                      train_psnr=tr_p,
+                                      perf={"it_per_s": it_s, "render_fps": None,
+                                            "train_s": round(train_s, 1), "peak_mem_gb": None,
+                                            "device": "blackhole-fast-resident-deviceloss"})
+                card["holdout"] = {"psnr": round(ho_p, 2), "ssim": round(ho_s, 4)}
+                evalcard.save(card, paths["eval_json"])
+                perc = card.get("perceptual", {})
+                print(f"[fast]   eval card -> {paths['eval_json']}", flush=True)
+            except Exception as e:
+                print(f"[fast]   WARN eval card skipped: {e}", flush=True)
+
+        # Representative-view panels (4 held-out views, full run only)
+        renders_dir = None
+        if not args.no_ply and not args.no_views:
+            renders_dir = paths["stem"] + "_renders"
+            os.makedirs(renders_dir, exist_ok=True)
+            # Reset bias to white bg before panel renders
+            setbuf(bias, torch.full((T, 256, 3), w_b), BF)
+            for i in range(min(4, len(te_c))):
+                run_geom_bin(te_c, i)
+                ttnn.execute_trace(DEV, rfid, cq_id=0, blocking=False)
+                ttnn.synchronize_device(DEV)
+                img = torch.zeros(H * W, 3).index_copy(0, tmap.gidx, dn(C).reshape(T * 256, 3)).reshape(H, W, 3)
+                _save_panel(os.path.join(renders_dir, f"view{i:02d}_panel.png"), te_i[i], img)
+            print(f"[fast]   panels -> {renders_dir}", flush=True)
+
+        # Canonical row (all required keys, in contract order)
+        row = {
+            "method": args.method,
+            "scene": args.scene_name, "G": G, "res": res, "K": K, "iters": args.iters,
+            "train_views": Ntr,
+            "holdout_psnr": round(ho_p, 2), "holdout_ssim": round(ho_s, 4),
+            "train_psnr": round(tr_p, 2), "train_ssim": round(tr_s, 4),
+            "hf_ratio": perc.get("hf_ratio"), "empty_space_leak": perc.get("empty_space_leak"),
+            "it_per_s": it_s, "render_fps": None, "train_s": round(train_s, 1),
+            "peak_mem_gb": None, "device": "blackhole-fast-resident-deviceloss",
+            "ply": ply_path, "eval_json": paths["eval_json"], "renders_dir": renders_dir,
+        }
+
+        # Incremental rollup (append to any existing rows from prior invocations)
+        rollup_path = os.path.join(args.out, "bh_fast_rollup.json")
+        existing_rows = []
+        if os.path.exists(rollup_path):
+            try:
+                with open(rollup_path) as f:
+                    existing_rows = json.load(f)
+            except Exception:
+                pass
+        existing_rows.append(row)
+        json.dump(existing_rows, open(rollup_path, "w"), indent=2)
+
+        # Summary (human-readable, regenerated from full rollup)
+        summary_path = os.path.join(args.out, "summary.txt")
+        with open(summary_path, "w") as f:
+            f.write(f"# {args.method} | res{res}/{args.iters}it\n")
+            f.write(f"# {'scene':8} {'G':>7} {'K':>4} {'it/s':>7} {'fps':>6} "
+                    f"{'ho_psnr':>8} {'ho_ssim':>8} {'hf':>8} {'leak':>8}\n")
+            for r in existing_rows:
+                k_str = "-" if r.get("K") is None else str(r["K"])
+                hf = f"{r['hf_ratio']:.4f}" if r.get("hf_ratio") is not None else "N/A"
+                leak = f"{r['empty_space_leak']:.4f}" if r.get("empty_space_leak") is not None else "N/A"
+                fps_str = f"{r['render_fps']:.0f}" if r.get("render_fps") is not None else "N/A"
+                f.write(f"  {r['scene']:8} {r['G']:>7} {k_str:>4} {r['it_per_s']:>7} "
+                        f"{fps_str:>6} {r['holdout_psnr']:>8} {r['holdout_ssim']:>8} "
+                        f"{hf:>8} {leak:>8}\n")
+        print(f"[fast]   rollup -> {rollup_path}", flush=True)
+        print("\n" + open(summary_path).read())
+
     finally:
         ttnn.close_device(DEV)
 

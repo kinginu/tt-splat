@@ -57,6 +57,14 @@ def _save_img(path, img):
     Image.fromarray(arr).save(path)
 
 
+def _save_panel(path, gt, render):
+    """Save GT (left) | render (right) side-by-side panel as uint8 PNG."""
+    gt_arr = (gt.clamp(0, 1).detach().cpu().numpy() * 255 + 0.5).astype(np.uint8)
+    rend_arr = (render.clamp(0, 1).detach().cpu().numpy() * 255 + 0.5).astype(np.uint8)
+    panel = np.concatenate([gt_arr, rend_arr], axis=1)
+    Image.fromarray(panel).save(path)
+
+
 @torch.no_grad()
 def _render_fps(model, cam, tmap, K, n=30):
     render_binned_device(model, cam, tmap, R=1, K=K)
@@ -78,7 +86,7 @@ def _eval_split(model, cams, imgs, tmap, K):
     return sum(ps) / len(ps), sum(ss) / len(ss)
 
 
-def run_one(scene_root, scene_name, G, K, res, iters, paths, bin_refresh, save_ply_file):
+def run_one(scene_root, scene_name, G, K, res, iters, paths, bin_refresh, save_ply_file, save_views, method):
     out_dir = paths["dir"]
     os.makedirs(out_dir, exist_ok=True)
     print(f"\n[bh] {scene_name} G={G} K={K} res={res} iters={iters}")
@@ -135,21 +143,13 @@ def run_one(scene_root, scene_name, G, K, res, iters, paths, bin_refresh, save_p
         tr_p, tr_s = _eval_split(model, tr_c[:10], tr_i[:10], tmap, K)
         fps = _render_fps(model, te_c[0], tmap, K)
 
-    # Save representative renders (4 test views)
-    renders_dir = os.path.join(out_dir, "renders")
-    os.makedirs(renders_dir, exist_ok=True)
-    with torch.no_grad():
-        for i, (c, g) in enumerate(zip(te_c[:4], te_i[:4])):
-            r = render_binned_device(model, c, tmap, R=1, K=K)
-            _save_img(os.path.join(renders_dir, f"test_{i:02d}_gt.png"), g)
-            _save_img(os.path.join(renders_dir, f"test_{i:02d}_render.png"), r)
-
     ply_path = ""
     if save_ply_file:
         ply_path = paths["ply"]
         plyio.save_ply(ply_path, model)
 
     # unified eval card (host cpu_render oracle with c_b swapped for the two-bg coverage trick); guarded
+    perc = {}
     try:
         def rfn(mdl, cam, b):
             saved = mdl.c_b.detach().clone()
@@ -158,23 +158,39 @@ def run_one(scene_root, scene_name, G, K, res, iters, paths, bin_refresh, save_p
                 return cpu_render(mdl, cam, "A")
             finally:
                 mdl.c_b.copy_(saved)
-        card = evalcard.build(model, te_ca, te_rgba, rfn, method=os.path.basename(os.path.dirname(out_dir)),
+        card = evalcard.build(model, te_ca, te_rgba, rfn, method=method,
                               scene=scene_name, G=G, res=res, iters=iters, K=K, train_psnr=tr_p,
                               perf={"it_per_s": it_per_s, "render_fps": round(fps, 1),
-                                    "train_s": round(train_s, 1), "device": "blackhole-bf16-binned-m6"})
+                                    "train_s": round(train_s, 1), "peak_mem_gb": None,
+                                    "device": "blackhole-bf16-binned-m6"})
+        card["holdout"] = {"psnr": round(ho_p, 2), "ssim": round(ho_s, 4)}
         evalcard.save(card, paths["eval_json"])
+        perc = card.get("perceptual", {})
         print(f"[bh]   eval card -> {paths['eval_json']}", flush=True)
     except Exception as e:
         print(f"[bh]   WARN eval card skipped: {e}", flush=True)
 
+    # Representative-view panels (4 held-out views, full run only)
+    renders_dir = None
+    if save_views:
+        renders_dir = paths["stem"] + "_renders"
+        os.makedirs(renders_dir, exist_ok=True)
+        with torch.no_grad():
+            for i, (c, g) in enumerate(zip(te_c[:4], te_i[:4])):
+                r = render_binned_device(model, c, tmap, R=1, K=K)
+                _save_panel(os.path.join(renders_dir, f"view{i:02d}_panel.png"), g, r)
+        print(f"[bh]   panels -> {renders_dir}", flush=True)
+
     row = {
-        "scene": scene_name, "G": G, "K": K, "res": res, "iters": iters,
+        "method": method,
+        "scene": scene_name, "G": G, "res": res, "K": K, "iters": iters,
         "train_views": N_train,
-        "train_s": round(train_s, 1), "it_per_s": it_per_s,
-        "render_fps": round(fps, 1),
         "holdout_psnr": round(ho_p, 2), "holdout_ssim": round(ho_s, 4),
         "train_psnr": round(tr_p, 2), "train_ssim": round(tr_s, 4),
-        "ply": ply_path, "device": "blackhole-bf16-binned-m6",
+        "hf_ratio": perc.get("hf_ratio"), "empty_space_leak": perc.get("empty_space_leak"),
+        "it_per_s": it_per_s, "render_fps": round(fps, 1), "train_s": round(train_s, 1),
+        "peak_mem_gb": None, "device": "blackhole-bf16-binned-m6",
+        "ply": ply_path, "eval_json": paths["eval_json"], "renders_dir": renders_dir,
     }
     print(f"[bh] {scene_name} G={G}: {it_per_s} it/s | render {fps:.0f} fps | "
           f"holdout {ho_p:.2f} dB/{ho_s:.4f} | train {tr_p:.2f} dB | "
@@ -192,6 +208,8 @@ def main():
     ap.add_argument("--method", default="routeB_bh", help="rough algo label for the unified output path")
     ap.add_argument("--bin-refresh", type=int, default=500)
     ap.add_argument("--no-ply", action="store_true")
+    ap.add_argument("--no-views", action="store_true",
+                    help="skip GT|render panel saves even on full runs")
     args = ap.parse_args()
 
     scenes = [s.strip() for s in args.scenes.split(",") if s.strip()]
@@ -213,20 +231,23 @@ def main():
                 K = _auto_k(G)
                 paths = evalcard.run_paths(args.method, scene, G, args.res, iters=args.iters,
                                            K=K, root=args.out)
+                save_views = not args.no_ply and not args.no_views
                 row = run_one(root, scene, G, K, args.res, args.iters, paths,
-                              args.bin_refresh, not args.no_ply)
+                              args.bin_refresh, not args.no_ply, save_views, args.method)
                 rows.append(row)
                 json.dump(rows, open(os.path.join(args.out, "bh_sweep_rollup.json"), "w"), indent=2)
 
         with open(os.path.join(args.out, "summary.txt"), "w") as f:
-            f.write(f"# route-B@Blackhole bf16+binned m6 | res{args.res}/{args.iters}it/"
-                    f"100train_stochastic | p150a\n")
-            f.write(f"# {'scene':6} {'G':>7} {'K':>4} {'it/s':>7} {'fps':>6} "
-                    f"{'ho_psnr':>8} {'ho_ssim':>8} {'tr_psnr':>8} {'min':>5}\n")
+            f.write(f"# {args.method} | res{args.res}/{args.iters}it\n")
+            f.write(f"# {'scene':8} {'G':>7} {'K':>4} {'it/s':>7} {'fps':>6} "
+                    f"{'ho_psnr':>8} {'ho_ssim':>8} {'hf':>8} {'leak':>8}\n")
             for r in rows:
-                f.write(f"  {r['scene']:6} {r['G']:>7} {r['K']:>4} {r['it_per_s']:>7} "
+                k_str = "-" if r.get("K") is None else str(r["K"])
+                hf = f"{r['hf_ratio']:.4f}" if r.get("hf_ratio") is not None else "N/A"
+                leak = f"{r['empty_space_leak']:.4f}" if r.get("empty_space_leak") is not None else "N/A"
+                f.write(f"  {r['scene']:8} {r['G']:>7} {k_str:>4} {r['it_per_s']:>7} "
                         f"{r['render_fps']:>6.0f} {r['holdout_psnr']:>8} {r['holdout_ssim']:>8} "
-                        f"{r['train_psnr']:>8} {r['train_s'] / 60:>5.1f}\n")
+                        f"{hf:>8} {leak:>8}\n")
 
         print("\n" + open(os.path.join(args.out, "summary.txt")).read())
         print(f"saved {len(rows)} configs -> {args.out}/")

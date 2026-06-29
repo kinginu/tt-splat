@@ -13,7 +13,7 @@ DEFAULT_LR = {
 
 
 def fit(model, cameras, gt_images, arm, iters=800, lambda_ssim=0.2, lr=None,
-        k=4.0, blur_eps=0.3, near=0.2, log_every=0):
+        k=4.0, blur_eps=0.3, near=0.2, log_every=0, sh_degree=0):
     """Returns the per-iteration mean loss history (list of floats)."""
     lr = {**DEFAULT_LR, **(lr or {})}
     opt = torch.optim.Adam(model.param_groups(lr))
@@ -22,7 +22,7 @@ def fit(model, cameras, gt_images, arm, iters=800, lambda_ssim=0.2, lr=None,
         opt.zero_grad(set_to_none=True)
         total = 0.0
         for cam, gt in zip(cameras, gt_images):
-            img = render(model, cam, arm, k=k, blur_eps=blur_eps, near=near)
+            img = render(model, cam, arm, k=k, blur_eps=blur_eps, near=near, sh_degree=sh_degree)
             total = total + metrics.loss_fn(img, gt, lambda_ssim)
         total = total / len(cameras)
         total.backward()

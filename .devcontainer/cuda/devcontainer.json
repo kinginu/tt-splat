@@ -1,0 +1,27 @@
+{
+  // CUDA / GPU devcontainer (Nvidia GPU VM, e.g. RTX 3090) for fast matrix-native math verification.
+  //
+  // IMAGE-BASED on purpose (not compose): VS Code Dev Containers runs `docker compose config`
+  // WITHOUT profile args, so it cannot bring up the profile-gated `cuda` compose service
+  // (microsoft/vscode-remote-release#5617). This standalone build + `--gpus all` is the robust
+  // GPU devcontainer pattern and mirrors the `cuda` compose service (same Dockerfile.cuda).
+  // Host prereq: nvidia-container-toolkit (configured). CLI equivalent: `docker compose run --rm cuda`.
+  "name": "tt-splat (CUDA / GPU)",
+  "build": { "context": "../..", "dockerfile": "../../Dockerfile.cuda" },
+  "runArgs": ["--gpus", "all", "--shm-size=16g"],
+  "workspaceFolder": "/workspace",
+  "workspaceMount": "source=${localWorkspaceFolder},target=/workspace,type=bind",
+
+  // Keep the container alive after the editor closes (matches the sim devcontainer).
+  "shutdownAction": "none",
+
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-python.python",
+        "redhat.vscode-yaml",
+        "davidanson.vscode-markdownlint"
+      ]
+    }
+  }
+}

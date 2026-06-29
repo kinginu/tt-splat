@@ -41,6 +41,8 @@ class GaussianModel(nn.Module):
 
         # color = clamp(0.5 + C0*dc, 0): gt gets varied colors, fit starts near gray.
         self.color_dc = nn.Parameter((randn(G, 3) * 1.5) if gt else (0.01 * randn(G, 3)))
+        # view-dependent colour SH rest (deg 1-3 = 15 coeffs x RGB); zeros => DC-only behaviour.
+        self.color_rest = nn.Parameter(torch.zeros(G, 15, 3, dtype=dtype, device=device))
 
         self.w_b_raw = nn.Parameter(torch.tensor(-3.0, dtype=dtype, device=device))    # w_b≈0.049
         self.depth_beta = nn.Parameter(torch.tensor(1.0, dtype=dtype, device=device))
@@ -86,6 +88,7 @@ class GaussianModel(nn.Module):
             {"params": [self.opacity_raw], "lr": lr["opacity"]},
             {"params": [self.opacity_sh], "lr": lr["opacity_sh"]},
             {"params": [self.color_dc], "lr": lr["color"]},
+            {"params": [self.color_rest], "lr": lr.get("color_rest", lr["color"] / 20.0)},
             {"params": [self.w_b_raw], "lr": lr["wb"]},
             {"params": [self.depth_beta, self.depth_tau], "lr": lr["depth"]},
             {"params": [self.softz_beta], "lr": lr["depth"]},

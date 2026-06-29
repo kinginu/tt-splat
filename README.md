@@ -113,9 +113,16 @@ at every step.
 > Matrix-native 3DGS changes the rendering math *used during training*: a polynomial splat kernel
 > `(1−Q/k)₊²` (no `exp`) and order-independent **weighted-sum blending** (no depth sort), instead of standard
 > 3DGS's exp-Gaussian + sorted-alpha. The gaussians are **fit to that renderer**, so opening our `.ply` in a
-> standard 3DGS viewer applies the wrong math and will **not** reproduce the trained appearance — a renderer
-> matching the training-time math is required (a viewer for it is in progress for release). *(Our `.ply` also
-> stores DC colour only, no SH-rest, so the faithful reference is the rendered image, not the `.ply`.)*
+> standard 3DGS viewer applies the wrong math and will **not** reproduce the trained appearance.
+
+### tt-splat-viewer
+
+**[kinginu/tt-splat-viewer](https://github.com/kinginu/tt-splat-viewer)** — a dedicated WebGPU viewer that
+renders tt-splat's poly-splat + Weighted Sum Rendering faithfully, and shows it **side-by-side with standard
+3DGS** so the difference is immediately visible. Built in Rust + wgpu; runs native and in-browser via WASM.
+
+*(Our `.ply` also stores DC colour only, no SH-rest, so the faithful reference is always the rendered image,
+not the raw `.ply`.)*
 
 **ficus** (fuzzy, **G=2000 / res128** — on par with gsplat). Panels: **GT · standard 3DGS (gsplat) · matrix-native (ours)**:
 

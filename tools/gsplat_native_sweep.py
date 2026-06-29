@@ -19,7 +19,9 @@ import random
 import sys
 import time
 
+import numpy as np
 import torch
+from PIL import Image
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
@@ -64,6 +66,31 @@ def render_fps(model, cam, n=50):
     return n / (time.time() - t)
 
 
+def _hconcat_panel(left, right):
+    """Horizontally concatenate two [H,W,3] float tensors or numpy arrays ([0,1]) -> uint8 [H,2W,3]."""
+    def _u8(t):
+        if isinstance(t, torch.Tensor):
+            t = t.detach().cpu().numpy()
+        return (np.clip(t, 0.0, 1.0) * 255 + 0.5).astype(np.uint8)
+    return np.concatenate([_u8(left), _u8(right)], axis=1)
+
+
+@torch.no_grad()
+def _save_view_panels(model, ho_c, ho_i, rfn, stem, n=4):
+    """Render first n held-out views and save GT|render side-by-side panels.
+
+    ho_i must be already white-composited [H,W,3] tensors (load_blender without keep_alpha).
+    rfn(model, cam, 1.0) gives a white-composited render, matching the GT.
+    """
+    renders_dir = stem + "_renders"
+    os.makedirs(renders_dir, exist_ok=True)
+    for i in range(min(n, len(ho_c))):
+        render = rfn(model, ho_c[i], 1.0)                           # [H,W,3] white-composited
+        panel = _hconcat_panel(ho_i[i], render)                     # GT | render
+        Image.fromarray(panel).save(os.path.join(renders_dir, f"view{i:02d}_panel.png"))
+    return renders_dir
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--scenes", default="ficus,lego")
@@ -79,9 +106,12 @@ def main():
     ap.add_argument("--method", default="gsplat", help="rough algo label for the output path")
     ap.add_argument("--card-views", type=int, default=8, help="held-out views for the eval card")
     ap.add_argument("--out", default="outputs", help="root; layout = <out>/<method>/<scene>/G<G>_res<res>")
+    ap.add_argument("--no-views", action="store_true",
+                    help="skip GT|render representative-view panels on full runs")
     args = ap.parse_args()
 
     dev = "cuda" if torch.cuda.is_available() else "cpu"
+    gpu_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu"
     Gs = [int(x) for x in args.G.split(",") if x]
     rows = []
     rfn = lambda mdl, cam, b: bg.render_gsplat(mdl, cam, bg=b)
@@ -113,26 +143,66 @@ def main():
             card = evalcard.build(m, cv_c, cv_rgba, rfn, method=args.method, scene=scene, G=G,
                                   res=args.res, iters=args.iters, seed=args.seed, train_psnr=tr_p,
                                   perf={"it_per_s": round(args.iters / train_s, 2),
-                                        "render_fps": round(fps, 1), "peak_vram_gb": round(vram, 2),
-                                        "train_s": round(train_s, 1)})
-            card["perceptual_25"] = {"holdout_psnr": round(ho_p, 2), "holdout_ssim": round(ho_s, 4)}
+                                        "render_fps": round(fps, 1), "peak_mem_gb": round(vram, 2),
+                                        "train_s": round(train_s, 1), "device": gpu_name})
+            card["holdout"] = {"psnr": round(ho_p, 2), "ssim": round(ho_s, 4)}
             evalcard.save(card, paths["eval_json"])
-            row = {"scene": scene, "G": G, "res": args.res, "holdout_psnr": round(ho_p, 2),
-                   "hf_ratio": card["perceptual"]["hf_ratio"],
-                   "empty_space_leak": card["perceptual"]["empty_space_leak"],
-                   "it_per_s": round(args.iters / train_s, 2), "render_fps": round(fps, 1),
-                   "ply": paths["ply"], "eval_json": paths["eval_json"]}
+
+            # representative-view panels (full runs only; skip when --no-views)
+            renders_dir = None
+            if not args.no_views:
+                renders_dir = _save_view_panels(m, ho_c, ho_i, rfn, paths["stem"])
+
+            row = {
+                "method": args.method,
+                "scene": scene,
+                "G": G,
+                "res": args.res,
+                "K": None,
+                "iters": args.iters,
+                "train_views": len(tr_c),
+                "holdout_psnr": round(ho_p, 2),
+                "holdout_ssim": round(ho_s, 4),
+                "train_psnr": round(tr_p, 2),
+                "train_ssim": round(tr_s, 4),
+                "hf_ratio": card["perceptual"]["hf_ratio"],
+                "empty_space_leak": card["perceptual"]["empty_space_leak"],
+                "it_per_s": round(args.iters / train_s, 2),
+                "render_fps": round(fps, 1),
+                "train_s": round(train_s, 1),
+                "peak_mem_gb": round(vram, 2),
+                "device": gpu_name,
+                "ply": paths["ply"],
+                "eval_json": paths["eval_json"],
+                "renders_dir": renders_dir,
+            }
             rows.append(row)
+            # write rollup incrementally after each run
+            rollup_path = os.path.join(args.out, "gsplat_sweep_rollup.json")
+            json.dump(rows, open(rollup_path, "w"), indent=2)
             print(f"[{scene} G={G}] {row['it_per_s']} it/s | {fps:.0f} fps | holdout {ho_p:.2f}dB "
                   f"| hf {row['hf_ratio']:.3f} leak {row['empty_space_leak']:.4f} "
                   f"-> {paths['eval_json']}", flush=True)
 
-    json.dump(rows, open(os.path.join(args.out, "gsplat_sweep_rollup.json"), "w"), indent=2)
-    print(f"\n# {'scene':6} {'G':>7} {'it/s':>6} {'fps':>6} {'ho_psnr':>8} {'hf_ratio':>9} {'leak':>8}")
+    # summary.txt (contract format)
+    summary_path = os.path.join(args.out, "summary.txt")
+    hdr1 = f"# {args.method} | res{args.res}/{args.iters}it"
+    hdr2 = (f"# {'scene':8} {'G':>8} {'K':>5} {'it/s':>7} {'fps':>6}"
+            f" {'ho_psnr':>8} {'ho_ssim':>8} {'hf':>8} {'leak':>8}")
+    lines = [hdr1, hdr2]
     for r in rows:
-        print(f"  {r['scene']:6} {r['G']:>7} {r['it_per_s']:>6} {r['render_fps']:>6} "
-              f"{r['holdout_psnr']:>8} {r['hf_ratio']:>9} {r['empty_space_leak']:>8}")
+        k_str = "-" if r["K"] is None else str(r["K"])
+        lines.append(
+            f"  {r['scene']:8} {r['G']:>8} {k_str:>5} {r['it_per_s']:>7.2f} {r['render_fps']:>6.0f}"
+            f" {r['holdout_psnr']:>8.2f} {r['holdout_ssim']:>8.4f}"
+            f" {r['hf_ratio']:>8.4f} {r['empty_space_leak']:>8.4f}"
+        )
+    with open(summary_path, "w") as f:
+        f.write("\n".join(lines) + "\n")
+    print("\n".join(lines))
     print(f"\nsaved {len(rows)} (ply + eval.json) under {args.out}/{args.method}/<scene>/")
+    print(f"rollup -> {rollup_path}")
+    print(f"summary -> {summary_path}")
 
 
 if __name__ == "__main__":

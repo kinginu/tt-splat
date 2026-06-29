@@ -87,6 +87,29 @@ def test_softz_depth_order():
     assert (C - s["blue"]).norm() < (C - s["red"]).norm(), C
 
 
+def test_bprime_occludes():
+    s = _setup()
+    C = arms.blend_BP(s["w_geo"], s["opacity_raw"], s["depth"], _f(0.5), s["color"], s["w_b"], s["c_b"])[0]
+    assert (C - s["red"]).norm() < (C - s["blue"]).norm(), C
+    assert C[0].item() > 0.85 and C[2].item() < 0.15, C
+    C2 = arms.blend_BP(s["w_geo"], s["opacity_raw"], s["depth"], _f(0.2), s["color"], s["w_b"], s["c_b"])[0]
+    assert C2[0].item() >= C[0].item()   # smaller tau -> harder
+
+
+def test_bprime_depth_order():
+    s = _setup()
+    C = arms.blend_BP(s["w_geo"], s["opacity_raw"], _f([5.0, 2.0]), _f(0.5), s["color"], s["w_b"], s["c_b"])[0]
+    assert (C - s["blue"]).norm() < (C - s["red"]).norm(), C
+
+
+def test_bprime_zgrad():
+    s = _setup()
+    z = s["depth"].clone().requires_grad_(True)
+    C = arms.blend_BP(s["w_geo"], s["opacity_raw"], z, _f(0.5), s["color"], s["w_b"], s["c_b"])
+    (g,) = torch.autograd.grad(C.sum(), z)
+    assert g.abs().sum() > 0
+
+
 if __name__ == "__main__":
     import sys
     sys.exit(_bootstrap.run_module(globals()))

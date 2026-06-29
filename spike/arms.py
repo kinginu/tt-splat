@@ -47,6 +47,20 @@ def blend_C(w_geo, opacity_sh, dirs, color, w_b, c_b):
     return _wsr(o[None, :] * w_geo, color, w_b, c_b)
 
 
+def blend_BP(w_geo, opacity_raw, depth, bp_tau, color, w_b, c_b, eps=1e-4):
+    """Pairwise soft-occlusion GEMM ('arm B′', candidate #5): per-gaussian transmittance
+    rho_i = exp(-(S beta)_i), S_ij = sigmoid((z_i - z_j)/tau) (j in front of i, diag zeroed),
+    beta_j = -log(1-o_j). tau->0 = exact alpha-transmittance Prod(1-o_j). Sort-free (S = [G,G]
+    GEMM, exp lane-wise); z ATTACHED (C3). One learnable scalar tau>0."""
+    o = torch.sigmoid(opacity_raw)
+    tau = bp_tau.clamp(min=1e-3)
+    beta = -torch.log1p(-(o.clamp(max=1.0 - eps)))                 # [G]
+    S = torch.sigmoid((depth[:, None] - depth[None, :]) / tau)     # [G,G]
+    S = S * (1.0 - torch.eye(S.shape[0], dtype=S.dtype, device=S.device))   # zero diagonal
+    rho = torch.exp(-(S @ beta))                                   # [G]
+    return _wsr(o[None, :] * w_geo * rho[None, :], color, w_b, c_b)
+
+
 def blend_SZ(w_geo, opacity_raw, depth, softz_beta, color, w_b, c_b, eps=1e-6):
     """soft-Z visibility prepass (OIT ladder rung 4): per-PIXEL local occlusion, sort-free, GEMM-bound.
 

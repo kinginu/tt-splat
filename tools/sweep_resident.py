@@ -99,17 +99,26 @@ def main():
     ap.add_argument("--lam-s", type=float, default=0.01)        # scale-L1 reg (kills runaway-scale spikes)
     ap.add_argument("--relocate-every", type=int, default=100)  # 0 disables relocation
     ap.add_argument("--dead-thr", type=float, default=0.005)
-    # depth-weight lever. off -> reproduces arm-A exactly.
+    # depth-weight lever (arm B). off -> reproduces arm-A exactly.
     ap.add_argument("--depth-weight", action="store_true")
     ap.add_argument("--beta0", type=float, default=1.0)
     ap.add_argument("--tau0", type=float, default=4.0)          # refined from z readback at warmup
     ap.add_argument("--lr-bt", type=float, default=0.02)        # Adam LR for beta/tau scalars
+    # arm-softmin lever (arm SM / candidate #2): rho=exp(-(mcz-zref)/tau), z ATTACHED (C3 z-force).
+    # Mutually exclusive with --depth-weight.
+    ap.add_argument("--arm-softmin", action="store_true")
+    ap.add_argument("--smtau0", type=float, default=1.5,
+                    help="softmin tau init (default 1.5; warmup sets zref to median visible mcz)")
+    ap.add_argument("--lr-smtau", type=float, default=0.02,    # Adam LR for tau scalar
+                    help="Adam LR for softmin tau scalar")
     # random-background training (gsplat-style honest-opacity; WSR bakes bg into the normalized avg
     # otherwise -> grey/white empty-space gaussians). per-iter random bg, c_B=bg; eval stays white.
     ap.add_argument("--random-bg", action="store_true")
     ap.add_argument("--colmap", default=None, help="path to a COLMAP scene root (real scene); overrides blender")
     ap.add_argument("--downscale", type=int, default=4, help="COLMAP image downscale factor")
     args = ap.parse_args()
+    assert not (args.depth_weight and args.arm_softmin), \
+        "--depth-weight and --arm-softmin are mutually exclusive"
     if args.colmap:
         args.random_bg = False                # real scenes have full backgrounds (no alpha) -> no random-bg
     res, G, K = args.res, args.G, args.K
@@ -192,6 +201,17 @@ def main():
         gbeta_buf = u(torch.zeros(G)); gtau_buf = u(torch.zeros(G))
         bt = {"beta": args.beta0, "tau": args.tau0}
         bt_m = {"beta": 0.0, "tau": 0.0}; bt_v = {"beta": 0.0, "tau": 0.0}
+        # arm-softmin lever: rho=exp(-(mcz-zref)/tau), sort-free, z ATTACHED (C3 z-force).
+        # inv_tau=1/tau, inv_tau2=1/tau^2 stored as [G,1] buffers (broadcast scalars);
+        # zref_buf = warmup median visible mcz, refreshed every ~500 iters.
+        if args.arm_softmin:
+            _sm_tau0 = args.smtau0
+            inv_tau_buf = u(torch.full((G,), 1.0 / _sm_tau0))
+            inv_tau2_buf = u(torch.full((G,), 1.0 / (_sm_tau0 ** 2)))
+            zref_buf = u(torch.zeros(G))                         # filled at warmup
+            gsmtau_buf = u(torch.zeros(G))
+            sm = {"tau": _sm_tau0}
+            sm_m = {"tau": 0.0}; sm_v = {"tau": 0.0}
         # camera buffers [G,1]
         Rvb = [[u(torch.zeros(G)) for _ in range(3)] for _ in range(3)]
         tvb = [u(torch.zeros(G)) for _ in range(3)]
@@ -245,6 +265,12 @@ def main():
                 rho = ttnn.sigmoid(M(beta_buf, A(tau_buf, ttnn.neg(cache["mcz"]))))   # sigmoid(beta*(tau-depth))
                 cache["rho"] = rho
                 keo = M(M(keep, o), rho)
+            elif args.arm_softmin:
+                # rho_sm = exp(-(mcz - zref) / tau); z ATTACHED (C3) -> z-force in geom_bwd.
+                # zref_buf is a [G,1] broadcast scalar (median visible mcz, refreshed ~500 iters).
+                rho_sm = ttnn.exp(M(A(cache["mcz"], ttnn.neg(zref_buf)), ttnn.neg(inv_tau_buf)))
+                cache["rho"] = rho_sm
+                keo = M(M(keep, o), rho_sm)
             else:
                 keo = M(keep, o)
             color = [ttnn.relu(A(M(P[k], C0), 0.5)) for k in ("cr", "cg", "cb")]
@@ -324,6 +350,20 @@ def main():
                 grad_pre = M(grad_rho, M(rho, A(one, ttnn.neg(rho))))   # *rho(1-rho)
                 ttnn.copy(M(grad_pre, A(tau_buf, ttnn.neg(cache["mcz"]))), gbeta_buf)  # grad_beta_pg = grad_pre*(tau-depth)
                 ttnn.copy(M(grad_pre, beta_buf), gtau_buf)                           # grad_tau_pg  = grad_pre*beta
+            elif args.arm_softmin:
+                rho_sm = cache["rho"]
+                # opacity grad: keo=keep*o*rho_sm -> extra rho_sm factor (mirrors arm B)
+                out["op"] = M(M(M(gkeo, keep), o1mo), rho_sm)
+                grad_rho = M(M(gkeo, keep), o)                 # dL/drho_sm  [G,1]
+                # tau grad: d(rho_sm)/d(tau) = rho_sm*(mcz-zref)/tau^2
+                ttnn.copy(M(grad_rho, M(rho_sm, M(A(cache["mcz"], ttnn.neg(zref_buf)), inv_tau2_buf))),
+                          gsmtau_buf)
+                # z-force (C3): d(rho_sm)/d(mcz) = -rho_sm/tau -> backprop into means
+                # mcz = Rv[2][0]*mx + Rv[2][1]*my + Rv[2][2]*mz + tv[2]
+                grad_mcz_occ = M(grad_rho, M(rho_sm, ttnn.neg(inv_tau_buf)))   # grad_rho*(-rho_sm/tau)
+                out["mx"] = A(out["mx"], M(grad_mcz_occ, Rvb[2][0]))
+                out["my"] = A(out["my"], M(grad_mcz_occ, Rvb[2][1]))
+                out["mz"] = A(out["mz"], M(grad_mcz_occ, Rvb[2][2]))
             else:
                 out["op"] = M(M(gkeo, keep), o1mo)
             # MCMC regularization gradients (density control): opacity-L1 + scale-L1.
@@ -362,6 +402,17 @@ def main():
                 bt[k] -= args.lr_bt * (bt_m[k] / bc1) / (math.sqrt(bt_v[k] / bc2) + EPS)
             setbuf(beta_buf, torch.full((G,), bt["beta"]), DT)
             setbuf(tau_buf, torch.full((G,), bt["tau"]), DT)
+
+        def adam_sm(t):
+            """host-side Adam for the softmin tau scalar (grad reduced from [G] device buffer sum)."""
+            bc1, bc2 = 1.0 - B1 ** t, 1.0 - B2 ** t
+            g = float(dn(gsmtau_buf).sum())
+            sm_m["tau"] = B1 * sm_m["tau"] + (1 - B1) * g
+            sm_v["tau"] = B2 * sm_v["tau"] + (1 - B2) * g * g
+            sm["tau"] -= args.lr_smtau * (sm_m["tau"] / bc1) / (math.sqrt(sm_v["tau"] / bc2) + EPS)
+            sm["tau"] = max(sm["tau"], 1e-3)             # clamp tau strictly positive
+            setbuf(inv_tau_buf, torch.full((G,), 1.0 / sm["tau"]), DT)
+            setbuf(inv_tau2_buf, torch.full((G,), 1.0 / (sm["tau"] ** 2)), DT)
 
         def _logit(p):
             return torch.log(p / (1.0 - p))
@@ -410,6 +461,13 @@ def main():
             zv = zc[kc] if bool(kc.any()) else zc
             bt["tau"] = float(zv.median()); setbuf(tau_buf, torch.full((G,), bt["tau"]), DT)
             print(f"[fast] depth-weight ON: beta0={bt['beta']:.3f} tau0={bt['tau']:.3f} lr_bt={args.lr_bt} "
+                  f"(z range {float(zv.min()):.2f}-{float(zv.max()):.2f})", flush=True)
+        if args.arm_softmin:                               # set zref to median visible mcz
+            zc = dn(cache["mcz"]).reshape(-1); kc = dn(keep).reshape(-1) > 0.5
+            zv = zc[kc] if bool(kc.any()) else zc
+            zref_val = float(zv.median())
+            setbuf(zref_buf, torch.full((G,), zref_val), DT)
+            print(f"[fast] arm-softmin ON: tau0={sm['tau']:.3f} zref={zref_val:.3f} lr_smtau={args.lr_smtau} "
                   f"(z range {float(zv.min()):.2f}-{float(zv.max()):.2f})", flush=True)
         idx, valid = assign_bins(dn(mu2d), dn(keep).reshape(-1) > 0.5, tmap, 1, K)
         setbuf(idx_u, idx.to(torch.int32).reshape(T, K), ttnn.uint32, ttnn.ROW_MAJOR_LAYOUT)
@@ -488,12 +546,21 @@ def main():
             adam_inplace(it + 1)
             if args.depth_weight:
                 adam_bt(it + 1)
+            if args.arm_softmin:
+                adam_sm(it + 1)
+                # refresh zref_buf every ~500 iters (zref = median visible mcz, re-read after sync)
+                if it > 0 and it % 500 == 0:
+                    ttnn.synchronize_device(DEV)
+                    zc = dn(cache["mcz"]).reshape(-1); kc = dn(keep).reshape(-1) > 0.5
+                    zv = zc[kc] if bool(kc.any()) else zc
+                    setbuf(zref_buf, torch.full((G,), float(zv.median())), DT)
             if args.relocate_every and it > 0 and it % args.relocate_every == 0:
                 relocate_host()
             if it % max(1, args.iters // 10) == 0:
                 ttnn.synchronize_device(DEV)
                 bt_s = f" | beta {bt['beta']:.3f} tau {bt['tau']:.3f}" if args.depth_weight else ""
-                print(f"   iter {it:5d}/{args.iters}  {(it + 1) / (time.perf_counter() - t0):.2f} it/s{bt_s}", flush=True)
+                sm_s = f" | sm_tau {sm['tau']:.3f}" if args.arm_softmin else ""
+                print(f"   iter {it:5d}/{args.iters}  {(it + 1) / (time.perf_counter() - t0):.2f} it/s{bt_s}{sm_s}", flush=True)
         ttnn.synchronize_device(DEV)
         train_s = time.perf_counter() - t0
         it_s = round(args.iters / train_s, 2)

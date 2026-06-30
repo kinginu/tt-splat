@@ -42,20 +42,28 @@ def _depth_warp(depth, near=0.5, far=8.0):
     return ((depth - near) / (far - near)).clamp(0.0, 1.0)
 
 
-def _moment_reconstruct(b, zw, m=4, eps=1e-6):
+def _moment_reconstruct(b, zw, m=4, eps=1e-6, recon="mboit", tau_softcmp=0.05):
     """Per-(pixel,gaussian) CDF fraction Â(z_g) in [0,1] using m+1 power moments.
     b: [P, m+1], zw: [G] in [0,1]. Returns A_hat [P, G].
 
     Strategy: minimum-norm / least-squares weight recovery on the Vandermonde system
-    zp.T @ w[p] = b_hat[p], then exact exclusive step CDF in depth order.
+    zp.T @ w[p] = b_hat[p], then sort-free CDF reconstruction via one of two variants:
+
+    recon="softcmp" (Variant A): pairwise sigmoid S[g,h]=σ((zw_g−zw_h)/τ) ("h in front of g"),
+        A_frac = w @ Sᵀ.  O(G²) GEMMs, no sort.  At τ→0 bit-identical to argsort+cumsum.
+    recon="mboit"   (Variant B, default): Münstermann et al. 2018 power-moment OIT closed-form.
+        Build (m/2+1)×(m/2+1) Hankel system from normalised moments, solve for polynomial
+        coefficients, find roots via companion-matrix eigvals, count fraction < zw[g].
+        O(P·m²) + O(P·(m/2)³ eigvals), no sort, matrix-engine friendly.
 
     For G < m+1 (e.g. 2-gaussian toy): overdetermined → least-squares via Gram [G,G].
       Recovers w ≈ a[g]/b0 exactly when the system is consistent.
     For G >= m+1 (e.g. 16-gaussian oracle): underdetermined → minimum-norm via Gram [m+1,m+1].
       w[g] = polynomial(zw[g]); when a[g]/b0 is approximately uniform the step CDF ≈ empirical CDF.
 
-    Sort is detached so grads flow through the recovered weights w (which depend on zw via zp
-    and b_hat), keeping the depth channel differentiable (C3).
+    grads flow through recovered weights w (which depend on zw via zp and b_hat), keeping the
+    depth channel differentiable (C3).  Neither variant calls argsort/sort/cumsum.
+    Reference: Münstermann et al. 2018, "Moment-Based Order-Independent Transparency".
     """
     P = b.shape[0]
     G = zw.shape[0]
@@ -77,22 +85,93 @@ def _moment_reconstruct(b, zw, m=4, eps=1e-6):
         gram2 = zp @ zp.T + reg * torch.eye(G, dtype=b.dtype, device=b.device)
         w = torch.linalg.solve(gram2, (zp @ b_hat.T)).T  # [P, G]
 
-    # Exclusive step CDF: sort by depth (detached), exclusive cumsum of w
-    order = zw.argsort().detach()               # [G]
-    w_sorted = w[:, order]                      # [P, G] sorted by depth
-    zeros = torch.zeros(P, 1, dtype=b.dtype, device=b.device)
-    cum_excl = torch.cat([zeros, w_sorted[:, :-1].cumsum(dim=1)], dim=1)  # [P, G]
-    A_hat = torch.zeros(P, G, dtype=b.dtype, device=b.device)
-    A_hat[:, order] = cum_excl
+    if recon == "softcmp":
+        # Variant A: soft-compare GEMM.
+        # S[g,h] = σ((zw_g − zw_h)/τ)  ≈  indicator[h is in front of g].
+        # A_frac[p,g] = Σ_h w[p,h] * S[g,h]  =  (w @ Sᵀ)[p,g].
+        # No sort, no cumsum.  At τ→0 recovers the exact sorted CDF.
+        S = torch.sigmoid((zw[:, None] - zw[None, :]) / tau_softcmp)   # [G,G]
+        S = S * (1.0 - torch.eye(G, dtype=zw.dtype, device=zw.device))  # zero self-compare
+        A_hat = (w @ S.T).clamp(0.0, 1.0)   # [P,G]
 
-    return A_hat.clamp(0.0, 1.0)
+    elif recon == "mboit":
+        # Variant B: Münstermann 2018 power-moment MBOIT closed-form.
+        # Normalized moments c[p,n] = b[p,n]/b0[p];  c[:,0] = 1 by construction.
+        c = b_hat  # [P, m+1]
+
+        half = m // 2  # for m=4: half=2
+
+        # Build (half+1)×(half+1) Hankel matrix per pixel: H[i,j] = c[:,i+j]
+        H = torch.stack([
+            torch.stack([c[:, i + j] for j in range(half + 1)], dim=-1)
+            for i in range(half + 1)
+        ], dim=-2)  # [P, half+1, half+1]
+
+        # Regularise for numerical stability
+        reg_H = eps * torch.eye(half + 1, dtype=b.dtype, device=b.device).unsqueeze(0)
+        H_reg = H + reg_H  # [P, half+1, half+1]
+
+        # Solve lower-left half×half sub-block for polynomial coefficients β.
+        # The monic polynomial z^half + β[half-1]*z^(half-1) + ... + β[0]
+        # has roots in [0,1] that are the canonical depth knots (CDF steps).
+        H_sub = H_reg[:, :half, :half]   # [P, half, half]
+        rhs2 = -H_reg[:, :half, half]    # [P, half]  (lower-right column, negated)
+        beta_lo = torch.linalg.solve(H_sub, rhs2.unsqueeze(-1)).squeeze(-1)  # [P, half]
+
+        # Build companion matrix for  z^half + beta_lo[half-1]*z^(half-1) + ... + beta_lo[0].
+        # Companion layout: sub-diagonal of 1s, last column = -beta_lo.
+        comp = torch.zeros(P, half, half, dtype=b.dtype, device=b.device)
+        if half > 1:
+            comp[:, 1:, :-1] = torch.eye(half - 1, dtype=b.dtype, device=b.device).unsqueeze(0)
+        comp[:, :, -1] = -beta_lo  # [P, half]
+
+        # Eigenvalues = polynomial roots.  Take real parts, clamp to [0,1].
+        eigs = torch.linalg.eigvals(comp)        # [P, half] complex
+        roots = eigs.real.clamp(0.0, 1.0)        # [P, half]
+
+        # Recover Gaussian-quadrature weights for the canonical atomic measure via overdetermined
+        # Vandermonde lstsq: use all m moments c_0..c_{m-1} for better weight conditioning.
+        # V[p, n, k] = roots[p,k]^n  (n=0..m-1, k=0..half-1) → [P, m, half]
+        # Solve V @ w_q ≈ c[:,0:m] in min-norm least-squares sense.
+        # Weights w_q satisfy Σ_k w_q[k]*root_k^n ≈ c_n; they sum to c_0=1.
+        n_rows = min(m, m + 1)  # use all available moment rows
+        V_r = torch.stack([roots ** n for n in range(n_rows)], dim=1)  # [P, n_rows, half]
+        b_vand = c[:, :n_rows]  # [P, n_rows]: c_0..c_{n_rows-1}
+        # lstsq: min_w ||V@w - b||^2  (overdetermined when n_rows > half)
+        w_q = torch.linalg.lstsq(V_r, b_vand.unsqueeze(-1)).solution.squeeze(-1)  # [P, half]
+        w_q = w_q.clamp(min=0.0)
+        w_q = w_q / (w_q.sum(dim=-1, keepdim=True).clamp(min=eps))   # normalize to sum=1
+
+        # Exclusive CDF: A_frac[p,g] = Σ_{k: root_k < zw_g} w_q[p,k]
+        # roots: [P, half, 1]  vs  zw: [1, 1, G]
+        # Use a small offset (EPS_CDF) to guard against the self-root edge case: when G≤half,
+        # the roots are at the gaussian depths up to ~1e-4 float error, so root_k ≈ zw_g would
+        # be incorrectly counted as "in front of" g.  EPS_CDF > max expected root error ensures
+        # the self-root is excluded; it's small enough not to drop genuinely frontal roots
+        # (G>half case: roots are Gauss-quadrature nodes, far from gaussian depths).
+        EPS_CDF = 1e-3
+        diff = roots.unsqueeze(-1) - zw[None, None, :]  # [P, half, G]: root_k - zw_g
+        in_front = diff < -EPS_CDF                       # root strictly before z_g, not at it
+        A_hat = (in_front.float() * w_q.unsqueeze(-1)).sum(dim=1)  # [P, G]
+        A_hat = A_hat.clamp(0.0, 1.0)
+
+    else:
+        raise ValueError(f"Unknown recon={recon!r}; expected 'softcmp' or 'mboit'")
+
+    return A_hat
 
 
-def blend_MO(w_geo, opacity_raw, depth, color, w_b, c_b, m=4, eps=1e-6):
+def blend_MO(w_geo, opacity_raw, depth, color, w_b, c_b, m=4, eps=1e-6,
+             recon="mboit", tau_softcmp=0.05):
     """Moment-based OIT (candidate #3): per-pixel transmittance from m power moments of the
     (depth, absorbance) measure; reconstruct T_i = exp(-b0 * Â(z_i)), composite OIT-over.
-    Sort-free (moments = GEMM, reconstruction = polynomial eval per pixel); z ATTACHED (C3).
+    Sort-free (moments = GEMM, reconstruction = sort-free variant); z ATTACHED (C3).
     OIT-style composite (not WSR): background gets true residual transmittance exp(-b0).
+
+    recon="mboit"   (default): Münstermann 2018 Hankel+companion-matrix CDF.  O(P·m²), no sort.
+    recon="softcmp": pairwise sigmoid A_frac=w@Sᵀ, S[g,h]=σ((zw_g−zw_h)/τ).  O(P·G²), no sort.
+    tau_softcmp: temperature for softcmp variant (default 0.05; τ→0 = exact sorted CDF).
+
     Reference: Münstermann et al. 2018, Moment-Based Order-Independent Transparency."""
     o = torch.sigmoid(opacity_raw)
     alpha = (o[None, :] * w_geo).clamp(eps, 1.0 - 1e-4)       # [P, G]
@@ -100,7 +179,8 @@ def blend_MO(w_geo, opacity_raw, depth, color, w_b, c_b, m=4, eps=1e-6):
     zw = _depth_warp(depth)                                     # [G] in [0,1]; attached
     zp = torch.stack([zw ** n for n in range(m + 1)], dim=-1)  # [G, m+1]
     b = a @ zp                                                  # [P, m+1] moments (GEMM)
-    A_frac = _moment_reconstruct(b, zw, m=m, eps=eps)          # [P, G] CDF fraction in [0,1]
+    A_frac = _moment_reconstruct(b, zw, m=m, eps=eps,
+                                 recon=recon, tau_softcmp=tau_softcmp)  # [P, G]
     T = torch.exp(-b[:, 0:1] * A_frac)                         # [P, G] transmittance
     W = alpha * T                                               # [P, G]
     num = W @ color                                             # [P, 3]
@@ -189,7 +269,8 @@ def blend_E(w_geo, opacity_raw, depth, e_tau, color, w_b, c_b, S=8, gen=None):
             C_s = color[winner]                                   # [P,3]
             if all_inf.any():
                 C_s = C_s.clone()
-                C_s[all_inf] = c_b.to(C_s.dtype)
+                n_inf = int(all_inf.sum())
+                C_s[all_inf] = c_b.to(C_s.dtype)[None, :].expand(n_inf, -1)
             results.append(C_s)
     hard = torch.stack(results).mean(0)                           # [P,3]
 

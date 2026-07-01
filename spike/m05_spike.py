@@ -176,21 +176,32 @@ def main():
         Gs = [int(x) for x in args.preflight.split(",")]
         pre = preflight(tr_cams, tr_imgs, Gs, args.iters, seed=0, extent=args.extent, device=dev)
 
-    rows = []
+    rows, skipped = [], []
     for seed in range(args.seeds):
         for arm in arms:
-            r = run_arm(arm, tr_cams, tr_imgs, ho_cams, ho_imgs, args.G, args.iters, seed, args.extent, device=dev, sh_degree=args.sh_degree, binned=args.binned)
+            try:
+                r = run_arm(arm, tr_cams, tr_imgs, ho_cams, ho_imgs, args.G, args.iters, seed, args.extent, device=dev, sh_degree=args.sh_degree, binned=args.binned)
+            except torch.cuda.OutOfMemoryError as e:
+                # Dense (O(P*G)) arms genuinely OOM at high res*G on a single GPU (the whole
+                # reason the binned PW render exists); skip this arm at this config rather than
+                # losing the other arms' results for the run.
+                if dev.type == "cuda":
+                    torch.cuda.empty_cache()
+                msg = str(e).splitlines()[0][:160]
+                print(f"  [{arm:>2} seed{seed}] OOM, skipping: {msg}")
+                skipped.append({"arm": arm, "seed": seed, "reason": f"OOM: {msg}"})
+                continue
             print(f"  [{arm:>2} seed{seed}] train {r['train_psnr']:.2f}  holdout {r['holdout_psnr']:.2f}  "
                   f"loss {r['final_loss']:.4f}  ({r['secs']:.0f}s)")
             rows.append(r)
 
-    agg = aggregate(rows)
+    agg = aggregate(rows) if rows else {}
     dec = decide(agg) if "D" in agg and any(a in agg for a in ("A", "B", "C")) else None
     if dec:
         report(agg, dec)
 
     os.makedirs(os.path.dirname(args.out), exist_ok=True)
-    payload = {"config": vars(args), "preflight": pre, "rows": rows, "agg": agg, "decision": dec}
+    payload = {"config": vars(args), "preflight": pre, "rows": rows, "skipped": skipped, "agg": agg, "decision": dec}
     with open(args.out + ".json", "w") as f:
         json.dump(payload, f, indent=2)
     print(f"saved {args.out}.json")

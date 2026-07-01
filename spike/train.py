@@ -23,17 +23,24 @@ def fit(model, cameras, gt_images, arm, iters=800, lambda_ssim=0.2, lr=None,
     lr = {**DEFAULT_LR, **(lr or {})}
     opt = torch.optim.Adam(model.param_groups(lr))
     render_fn = render_fn or render
+    n = len(cameras)
     history = []
     for it in range(iters):
         opt.zero_grad(set_to_none=True)
-        total = 0.0
+        loss_sum = 0.0
+        # Backward per-camera (grads accumulate additively across the loop -- multiple
+        # .backward() calls without an intervening zero_grad sum into .grad) instead of summing
+        # every camera's loss into one graph and calling backward() once. Mathematically
+        # identical (backward is linear: d(sum_i L_i/n)/dp = sum_i d(L_i/n)/dp), but peak memory
+        # is one camera's forward graph instead of n_train of them -- needed for dense O(P*G)
+        # arms (A/D) at scale; harmless for the cheap binned arms too.
         for cam, gt in zip(cameras, gt_images):
             img = render_fn(model, cam, arm, k=k, blur_eps=blur_eps, near=near, sh_degree=sh_degree)
-            total = total + metrics.loss_fn(img, gt, lambda_ssim)
-        total = total / len(cameras)
-        total.backward()
+            loss = metrics.loss_fn(img, gt, lambda_ssim) / n
+            loss.backward()
+            loss_sum += float(loss.detach())
         opt.step()
-        history.append(float(total.detach()))
+        history.append(loss_sum)
         if log_every and (it % log_every == 0 or it == iters - 1):
             print(f"    iter {it:4d}  loss {history[-1]:.5f}")
     return history

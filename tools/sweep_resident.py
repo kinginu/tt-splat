@@ -35,7 +35,7 @@ from spike.train import DEFAULT_LR
 from m4_train_binned import TileMap, assign_bins, K_POLY
 from geom_device import device_fwd_core, device_bwd_core, A, M
 from traced_fwd import gather_theta_buf
-from resident_traced import render_bwd, theta_bwd, PN, B1, B2, EPS
+from resident_traced import render_bwd, theta_bwd, T3, PN, B1, B2, EPS
 from loss_manual import gauss_1d, band_matrix, C1 as L_C1, C2 as L_C2, LAMBDA as L_LAM
 
 C0 = sh.C0
@@ -111,14 +111,23 @@ def main():
                     help="softmin tau init (default 1.5; warmup sets zref to median visible mcz)")
     ap.add_argument("--lr-smtau", type=float, default=0.02,    # Adam LR for tau scalar
                     help="Adam LR for softmin tau scalar")
+    # arm-pairwise lever (arm PW / candidate #5 redux): per-tile [K,K] soft-compare GEMM,
+    # OIT-over composite (replaces render_fwd_cache/render_bwd entirely for this arm).
+    # Mutually exclusive with --depth-weight/--arm-softmin.
+    ap.add_argument("--arm-pairwise", action="store_true",
+                    help="per-tile pairwise soft-occlusion (arm PW): OIT-over composite")
+    ap.add_argument("--pwtau0", type=float, default=0.01,
+                    help="PW pairwise soft-compare tau init (GPU bake-off winner value)")
+    ap.add_argument("--lr-pwtau", type=float, default=0.02,
+                    help="Adam LR for the pw_tau scalar")
     # random-background training (gsplat-style honest-opacity; WSR bakes bg into the normalized avg
     # otherwise -> grey/white empty-space gaussians). per-iter random bg, c_B=bg; eval stays white.
     ap.add_argument("--random-bg", action="store_true")
     ap.add_argument("--colmap", default=None, help="path to a COLMAP scene root (real scene); overrides blender")
     ap.add_argument("--downscale", type=int, default=4, help="COLMAP image downscale factor")
     args = ap.parse_args()
-    assert not (args.depth_weight and args.arm_softmin), \
-        "--depth-weight and --arm-softmin are mutually exclusive"
+    assert sum([args.depth_weight, args.arm_softmin, args.arm_pairwise]) <= 1, \
+        "--depth-weight, --arm-softmin, --arm-pairwise are mutually exclusive"
     if args.colmap:
         args.random_bg = False                # real scenes have full backgrounds (no alpha) -> no random-bg
     res, G, K = args.res, args.G, args.K
@@ -212,6 +221,21 @@ def main():
             gsmtau_buf = u(torch.zeros(G))
             sm = {"tau": _sm_tau0}
             sm_m = {"tau": 0.0}; sm_v = {"tau": 0.0}
+        # arm-pairwise lever: per-tile [K,K] soft-compare GEMM S[g,h]=sigmoid((zw_g-zw_h)/tau),
+        # OIT-over composite. tau buffers fully replicated to consumption shape (not [1,1]
+        # broadcast, mirrors the beta/tau/inv_tau full-replicate convention above).
+        if args.arm_pairwise:
+            NEAR_PW, FAR_PW = 0.5, 8.0
+            _pw_tau0 = args.pwtau0
+            pw_inv_tau_buf = u(torch.full((T, K, K), 1.0 / _pw_tau0), DT)       # for u_arg = d_raw * inv_tau
+            pw_inv_tau_k1_buf = u(torch.full((T, K, 1), 1.0 / _pw_tau0), DT)    # for gzw = (rowsum-colsum) * inv_tau
+            pw_inv_tau2_buf = u(torch.full((T, 1, 1), 1.0 / (_pw_tau0 ** 2)), DT)  # for gtau coefficient
+            one_minus_I_buf = u((1.0 - torch.eye(K))[None].expand(T, K, K).contiguous(), DT)  # constant, never updated
+            cb_bcast = u(m.c_b[None, None, :].expand(T, 256, 3).contiguous(), BF)  # constant c_b (not w_b-scaled)
+            gmcz_occ_buf = u(torch.zeros(G))          # [G,1] per-gaussian z-force grad accumulator (host-scattered)
+            gpwtau_buf = u(torch.zeros(T, 1, 1), DT)  # [T,1,1] per-tile tau-grad, host-summed over T
+            pw = {"tau": _pw_tau0}
+            pw_m = {"tau": 0.0}; pw_v = {"tau": 0.0}
         # camera buffers [G,1]
         Rvb = [[u(torch.zeros(G)) for _ in range(3)] for _ in range(3)]
         tvb = [u(torch.zeros(G)) for _ in range(3)]
@@ -286,9 +310,98 @@ def main():
             num = ttnn.add(ttnn.matmul(w, col, core_grid=CG), bias)
             return ttnn.div(num, den), (relu_Q, w, den, num)
 
+        def render_fwd_pw(thU, col, oc, mcz):
+            """PW forward (candidate #5 redux, per-tile [T,256,K]): pairwise soft-occlusion via a
+            [K,K] soft-compare GEMM on the true per-(pixel,gaussian) absorbance. REPLACES
+            render_fwd_cache entirely for this arm -- no WSR den/div; OIT-over composite with
+            residual background transmittance T_bg*c_b. z ATTACHED through zw_t (C3)."""
+            relu_Q = ttnn.relu(ttnn.matmul(Phi, thU, core_grid=CG))
+            w = ttnn.square(relu_Q)                                            # [T,256,K] w_geo
+            oc_row = T3(oc)                                                    # [T,1,K]
+            alpha_raw = ttnn.mul(w, oc_row)                                    # [T,256,K] broadcast dim-2
+            alpha_pg = ttnn.clamp(alpha_raw, 1e-6, 1.0 - 1e-4)
+            alpha_gate = ttnn.mul(ttnn.gtz(ttnn.add(alpha_raw, -1e-6)),
+                                  ttnn.gtz(ttnn.add(ttnn.neg(alpha_raw), 1.0 - 1e-4)))
+            one_minus_alpha = ttnn.add(ttnn.neg(alpha_pg), 1.0)
+            a_pg = ttnn.neg(ttnn.log(one_minus_alpha))                         # [T,256,K] -log(1-alpha)
+
+            # ttnn.embedding requires BFLOAT16 weights -- one unavoidable bf16 round-trip on the
+            # gather itself, but immediately upcast back to fp32 so the tau=0.01-sharp sigmoid
+            # compare below doesn't compound further bf16 rounding on top of it.
+            z_t = ttnn.typecast(ttnn.embedding(idx_u, ttnn.typecast(mcz, BF)), DT)  # [T,K,1]
+            zw_raw = ttnn.mul(ttnn.add(z_t, -NEAR_PW), 1.0 / (FAR_PW - NEAR_PW))
+            zw_t = ttnn.clamp(zw_raw, 0.0, 1.0)                                # [T,K,1]
+            zw_gate = ttnn.mul(ttnn.gtz(zw_raw), ttnn.gtz(ttnn.add(ttnn.neg(zw_raw), 1.0)))
+            zw_row = T3(zw_t)                                                  # [T,1,K]
+            d_raw = ttnn.add(zw_t, ttnn.neg(zw_row))                           # [T,K,K] d_raw[g,h]=zw[g]-zw[h]
+            u_arg = ttnn.mul(d_raw, pw_inv_tau_buf)                            # [T,K,K]
+            S_raw = ttnn.sigmoid(u_arg)
+            S = ttnn.mul(S_raw, one_minus_I_buf)                               # [T,K,K] diagonal zeroed
+
+            S_bf = ttnn.typecast(S, BF)
+            logT_raw = ttnn.neg(ttnn.matmul(a_pg, T3(S_bf), core_grid=CG))     # [T,256,K]
+            logT_gate = ttnn.gtz(ttnn.add(logT_raw, 30.0))                     # 1 where logT_raw > -30
+            logT = ttnn.clamp(logT_raw, -30.0, 0.0)                            # upper bound 0.0 exact (a>=0,S>=0)
+            Tt = ttnn.exp(logT)                                                # [T,256,K]
+            wT = ttnn.mul(w, Tt)                                               # [T,256,K]
+            num = ttnn.matmul(wT, col, core_grid=CG)                           # [T,256,3]
+            a_sum = ttnn.sum(a_pg, dim=-1, keepdim=True)                       # [T,256,1]
+            T_bg = ttnn.exp(ttnn.neg(a_sum))                                   # [T,256,1]
+            C = ttnn.add(num, ttnn.mul(T_bg, cb_bcast))                        # [T,256,3]
+
+            cache = dict(w=w, Tt=Tt, wT=wT, a_pg=a_pg, S=S, d_raw=d_raw, T_bg=T_bg,
+                        alpha_gate=alpha_gate, logT_gate=logT_gate, zw_gate=zw_gate,
+                        relu_Q=relu_Q, col=col, oc_row=oc_row)
+            return C, cache
+
+        def render_bwd_pw(gC, cache):
+            """PW backward. Returns (gthU, gcol, goc, gmcz_occ_t) -- gthU/gcol/goc feed the existing
+            theta_bwd / gco_buf / gocl_buf machinery unchanged; gmcz_occ_t[T,K,1] is NEW and is
+            host-scattered to gmcz_occ_buf[G,1] before geom_bwd runs (the C3 z-force)."""
+            w, Tt, wT = cache["w"], cache["Tt"], cache["wT"]
+            a_pg, S, d_raw, T_bg = cache["a_pg"], cache["S"], cache["d_raw"], cache["T_bg"]
+            alpha_gate, logT_gate = cache["alpha_gate"], cache["logT_gate"]
+            relu_Q, col = cache["relu_Q"], cache["col"]
+
+            gT_bg = ttnn.sum(ttnn.mul(gC, cb_bcast), dim=-1, keepdim=True)     # [T,256,1]
+            gwT = ttnn.matmul(gC, T3(col), core_grid=CG)                       # [T,256,K]
+            gcol = ttnn.matmul(T3(wT), gC, core_grid=CG)                       # [T,K,3]
+            gw_num = ttnn.mul(gwT, Tt)                                         # [T,256,K]
+            gTt = ttnn.mul(gwT, w)                                             # [T,256,K]
+            glogT = ttnn.mul(gTt, ttnn.mul(Tt, logT_gate))                     # [T,256,K]
+            S_bf = ttnn.typecast(S, BF)
+            ga_logT = ttnn.neg(ttnn.matmul(glogT, S_bf, core_grid=CG))         # [T,256,K] (no transpose on S)
+            gS_raw = ttnn.neg(ttnn.matmul(T3(glogT), a_pg, core_grid=CG))      # [T,K,K] (sums over the 256 pixels)
+            gS = ttnn.typecast(gS_raw, DT)
+
+            ga_bg = ttnn.mul(ttnn.neg(gT_bg), T_bg)                            # [T,256,1]
+            ga = ttnn.add(ga_logT, ga_bg)                                      # [T,256,K] broadcast last-dim
+            galpha = ttnn.mul(ttnn.mul(ga, ttnn.exp(a_pg)), alpha_gate)        # ga*1/(1-alpha)*gate (1/(1-a)=exp(a_pg))
+            gw_alpha = ttnn.mul(galpha, cache["oc_row"])                       # [T,256,K]
+            goc_pg = ttnn.mul(galpha, w)                                       # [T,256,K]
+            goc = T3(ttnn.sum(goc_pg, dim=1, keepdim=True))                    # [T,K,1]
+            gw = ttnn.add(gw_num, gw_alpha)                                    # [T,256,K]
+
+            gu = ttnn.mul(gS, ttnn.mul(S, ttnn.add(ttnn.neg(S), 1.0)))         # [T,K,K] gS*S*(1-S)
+            rowsum = ttnn.sum(gu, dim=-1, keepdim=True)                        # [T,K,1]
+            colsum = T3(ttnn.sum(gu, dim=1, keepdim=True))                     # [T,K,1]
+            gzw = ttnn.mul(ttnn.add(rowsum, ttnn.neg(colsum)), pw_inv_tau_k1_buf)   # [T,K,1]
+            gmcz_occ_t = ttnn.mul(ttnn.mul(gzw, cache["zw_gate"]), 1.0 / (FAR_PW - NEAR_PW))  # [T,K,1]
+
+            gu_d = ttnn.mul(gu, d_raw)                                         # [T,K,K]
+            gtau_step1 = ttnn.sum(gu_d, dim=-1, keepdim=True)                  # [T,K,1]
+            gtau_step2 = ttnn.sum(gtau_step1, dim=1, keepdim=True)             # [T,1,1]
+            ttnn.copy(ttnn.mul(gtau_step2, ttnn.neg(pw_inv_tau2_buf)), gpwtau_buf)
+
+            gthU = ttnn.matmul(T3(Phi), ttnn.mul(gw, ttnn.mul(relu_Q, 2.0)), core_grid=CG)
+            return gthU, gcol, goc, gmcz_occ_t
+
         def rend_fwd():
             theta, col_t, oc_t = gather_theta_buf(conic, mu2d, color_o, keo, idx_u, valid6, vf, origins_t, bump_buf, T, K)
-            Cc, rc = render_fwd_cache(theta, col_t, oc_t)
+            if args.arm_pairwise:
+                Cc, rc = render_fwd_pw(theta, col_t, oc_t, cache["mcz"])
+            else:
+                Cc, rc = render_fwd_cache(theta, col_t, oc_t)
             return Cc, rc, theta, col_t, oc_t
 
         C, rc, theta, col_t, oc_t = rend_fwd()
@@ -325,11 +438,15 @@ def main():
         def rend_bwd():
             conic_t = ttnn.embedding(idx_u, ttnn.typecast(conic, BF))
             mu_t = ttnn.embedding(idx_u, ttnn.typecast(mu2d, BF))
-            gthU, gcol, goc = render_bwd(Phi, col_t, oc_t, gC_buf, rc)
+            if args.arm_pairwise:
+                gthU, gcol, goc, gmcz_occ_t = render_bwd_pw(gC_buf, rc)
+            else:
+                gthU, gcol, goc = render_bwd(Phi, col_t, oc_t, gC_buf, rc)
+                gmcz_occ_t = None
             gct, gmt = theta_bwd(gthU, conic_t, mu_t, origins_t, valid6, T, K)
-            return gct, gmt, gcol, goc
+            return gct, gmt, gcol, goc, gmcz_occ_t
 
-        gct, gmt, gcol, goc = rend_bwd()
+        gct, gmt, gcol, goc, gmcz_occ_t = rend_bwd()
 
         def geom_bwd():
             gg = device_bwd_core(cache, gcon_buf["a"], gcon_buf["b"], gcon_buf["c"], gcon_buf["mx"], gcon_buf["my"])
@@ -366,6 +483,14 @@ def main():
                 out["mz"] = A(out["mz"], M(grad_mcz_occ, Rvb[2][2]))
             else:
                 out["op"] = M(M(gkeo, keep), o1mo)
+            if args.arm_pairwise:
+                # z-force (C3): gmcz_occ_buf is the host-scattered per-gaussian sum of
+                # render_bwd_pw's per-tile-slot gmcz_occ_t (train loop scatters it in before
+                # this trace runs). Purely additive on top of whichever opacity branch ran above
+                # (PW itself falls into the plain `else` branch -- no rho fold-in in geom_fwd).
+                out["mx"] = A(out["mx"], M(gmcz_occ_buf, Rvb[2][0]))
+                out["my"] = A(out["my"], M(gmcz_occ_buf, Rvb[2][1]))
+                out["mz"] = A(out["mz"], M(gmcz_occ_buf, Rvb[2][2]))
             # MCMC regularization gradients (density control): opacity-L1 + scale-L1.
             # dReg/dop_raw = lam_o/G * o(1-o);  dReg/dlx = lam_s/(3G) * exp(lx)=sx  (mean over G / 3G)
             lo, ls = args.lam_o / G, args.lam_s / (3.0 * G)
@@ -413,6 +538,18 @@ def main():
             sm["tau"] = max(sm["tau"], 1e-3)             # clamp tau strictly positive
             setbuf(inv_tau_buf, torch.full((G,), 1.0 / sm["tau"]), DT)
             setbuf(inv_tau2_buf, torch.full((G,), 1.0 / (sm["tau"] ** 2)), DT)
+
+        def adam_pw(t):
+            """host-side Adam for the global pw_tau scalar (grad reduced from [T,1,1] device buffer sum)."""
+            bc1, bc2 = 1.0 - B1 ** t, 1.0 - B2 ** t
+            g = float(dn(gpwtau_buf).sum())          # sum over T tiles
+            pw_m["tau"] = B1 * pw_m["tau"] + (1 - B1) * g
+            pw_v["tau"] = B2 * pw_v["tau"] + (1 - B2) * g * g
+            pw["tau"] -= args.lr_pwtau * (pw_m["tau"] / bc1) / (math.sqrt(pw_v["tau"] / bc2) + EPS)
+            pw["tau"] = max(pw["tau"], 1e-3)             # clamp tau strictly positive
+            setbuf(pw_inv_tau_buf, torch.full((T, K, K), 1.0 / pw["tau"]), DT)
+            setbuf(pw_inv_tau_k1_buf, torch.full((T, K, 1), 1.0 / pw["tau"]), DT)
+            setbuf(pw_inv_tau2_buf, torch.full((T, 1, 1), 1.0 / (pw["tau"] ** 2)), DT)
 
         def _logit(p):
             return torch.log(p / (1.0 - p))
@@ -473,7 +610,7 @@ def main():
         setbuf(idx_u, idx.to(torch.int32).reshape(T, K), ttnn.uint32, ttnn.ROW_MAJOR_LAYOUT)
         setbuf(valid6, valid[:, None, :].expand(T, 6, K).float()); setbuf(vf, valid[..., None].float())
         C, rc, theta, col_t, oc_t = rend_fwd()
-        loss_grad_dev(); gct, gmt, gcol, goc = rend_bwd(); gout = geom_bwd()
+        loss_grad_dev(); gct, gmt, gcol, goc, gmcz_occ_t = rend_bwd(); gout = geom_bwd()
         ttnn.synchronize_device(DEV)
 
         # ===== (C) capture traces =====
@@ -483,7 +620,7 @@ def main():
         ttnn.execute_trace(DEV, gfid, cq_id=0, blocking=False); ttnn.synchronize_device(DEV)
         rfid, (C, rc, theta, col_t, oc_t) = cap(rend_fwd)
         lfid, _ = cap(loss_grad_dev)
-        rbid, (gct, gmt, gcol, goc) = cap(rend_bwd)
+        rbid, (gct, gmt, gcol, goc, gmcz_occ_t) = cap(rend_bwd)
         gbid, gout = cap(geom_bwd)
         ttnn.synchronize_device(DEV)
 
@@ -540,6 +677,9 @@ def main():
             for j in range(3):
                 setbuf(gco_buf[j], gcolor_o[:, j], DT)
             setbuf(gocl_buf, go_col[:, 0], DT)
+            if args.arm_pairwise:
+                gmcz_occ = torch.zeros(G, 1).index_add_(0, flat, (dn(gmcz_occ_t) * vfh).reshape(-1, 1))
+                setbuf(gmcz_occ_buf, gmcz_occ[:, 0], DT)
             ttnn.execute_trace(DEV, gbid, cq_id=0, blocking=False)
             for k in PN:
                 ttnn.copy(gout[k], gacc[k])
@@ -554,13 +694,16 @@ def main():
                     zc = dn(cache["mcz"]).reshape(-1); kc = dn(keep).reshape(-1) > 0.5
                     zv = zc[kc] if bool(kc.any()) else zc
                     setbuf(zref_buf, torch.full((G,), float(zv.median())), DT)
+            if args.arm_pairwise:
+                adam_pw(it + 1)
             if args.relocate_every and it > 0 and it % args.relocate_every == 0:
                 relocate_host()
             if it % max(1, args.iters // 10) == 0:
                 ttnn.synchronize_device(DEV)
                 bt_s = f" | beta {bt['beta']:.3f} tau {bt['tau']:.3f}" if args.depth_weight else ""
                 sm_s = f" | sm_tau {sm['tau']:.3f}" if args.arm_softmin else ""
-                print(f"   iter {it:5d}/{args.iters}  {(it + 1) / (time.perf_counter() - t0):.2f} it/s{bt_s}{sm_s}", flush=True)
+                pw_s = f" | pw_tau {pw['tau']:.4f}" if args.arm_pairwise else ""
+                print(f"   iter {it:5d}/{args.iters}  {(it + 1) / (time.perf_counter() - t0):.2f} it/s{bt_s}{sm_s}{pw_s}", flush=True)
         ttnn.synchronize_device(DEV)
         train_s = time.perf_counter() - t0
         it_s = round(args.iters / train_s, 2)

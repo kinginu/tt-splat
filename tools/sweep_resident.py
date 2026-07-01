@@ -649,7 +649,21 @@ def main():
         # ===== (D) train loop =====
         idx, valid = run_geom_bin(tr_c, 0)
         t0 = time.perf_counter()
+        PROF = os.environ.get("PW_PROFILE") == "1"
+        _pacc = {}; _pn = [0]; _pt = [None]
+        def mark(name):
+            if not PROF:
+                return
+            ttnn.synchronize_device(DEV); now = time.perf_counter()
+            if _pt[0] is not None and name is not None:
+                _pacc[name] = _pacc.get(name, 0.0) + (now - _pt[0])
+            _pt[0] = now
         for it in range(args.iters):
+            if PROF and it == 10:
+                _pacc.clear(); _pn[0] = 0
+            if PROF:
+                _pn[0] += 1
+            mark(None)
             v = int(torch.randint(Ntr, (1,)).item())
             setcam(tr_c, v)
             if args.random_bg:                                 # composite GT over a random bg; c_B=bg
@@ -658,15 +672,21 @@ def main():
                 setbuf(bias, (w_b * bg)[None, None, :].expand(T, 256, 3).contiguous(), BF)
             else:
                 ttnn.copy(gt_res[v], y_d)
+            mark("input")
             ttnn.execute_trace(DEV, gfid, cq_id=0, blocking=False)
+            mark("geom_fwd")
             if it % args.bin_every == 0:
                 ttnn.synchronize_device(DEV)
                 idx, valid = assign_bins(dn(mu2d), dn(keep).reshape(-1) > 0.5, tmap, 1, K)
                 setbuf(idx_u, idx.to(torch.int32).reshape(T, K), ttnn.uint32, ttnn.ROW_MAJOR_LAYOUT)
                 setbuf(valid6, valid[:, None, :].expand(T, 6, K).float()); setbuf(vf, valid[..., None].float())
+                mark("bin")
             ttnn.execute_trace(DEV, rfid, cq_id=0, blocking=False)
+            mark("rend_fwd")
             ttnn.execute_trace(DEV, lfid, cq_id=0, blocking=False)
+            mark("loss")
             ttnn.execute_trace(DEV, rbid, cq_id=0, blocking=False); ttnn.synchronize_device(DEV)
+            mark("rend_bwd")
             flat = idx.reshape(-1); vfh = valid[..., None].float()
             gconic = torch.zeros(G, 3).index_add_(0, flat, dn(gct).reshape(-1, 3))
             gmu2d = torch.zeros(G, 2).index_add_(0, flat, dn(gmt).reshape(-1, 2))
@@ -680,9 +700,11 @@ def main():
             if args.arm_pairwise:
                 gmcz_occ = torch.zeros(G, 1).index_add_(0, flat, (dn(gmcz_occ_t) * vfh).reshape(-1, 1))
                 setbuf(gmcz_occ_buf, gmcz_occ[:, 0], DT)
+            mark("scatter")
             ttnn.execute_trace(DEV, gbid, cq_id=0, blocking=False)
             for k in PN:
                 ttnn.copy(gout[k], gacc[k])
+            mark("geom_bwd")
             adam_inplace(it + 1)
             if args.depth_weight:
                 adam_bt(it + 1)
@@ -696,6 +718,7 @@ def main():
                     setbuf(zref_buf, torch.full((G,), float(zv.median())), DT)
             if args.arm_pairwise:
                 adam_pw(it + 1)
+            mark("adam")
             if args.relocate_every and it > 0 and it % args.relocate_every == 0:
                 relocate_host()
             if it % max(1, args.iters // 10) == 0:
@@ -705,6 +728,12 @@ def main():
                 pw_s = f" | pw_tau {pw['tau']:.4f}" if args.arm_pairwise else ""
                 print(f"   iter {it:5d}/{args.iters}  {(it + 1) / (time.perf_counter() - t0):.2f} it/s{bt_s}{sm_s}{pw_s}", flush=True)
         ttnn.synchronize_device(DEV)
+        if PROF and _pn[0] > 0:
+            _n = _pn[0]; _tot = sum(_pacc.values())
+            print(f"\n=== PER-ITER PROFILE (n={_n}, bin_every={args.bin_every}, G={G}, res={res}) ===", flush=True)
+            for _k in sorted(_pacc, key=lambda x: -_pacc[x]):
+                print(f"  {_k:10s} {_pacc[_k]/_n*1000:8.2f} ms/iter  ({100*_pacc[_k]/_tot:5.1f}%)", flush=True)
+            print(f"  {'TOTAL':10s} {_tot/_n*1000:8.2f} ms/iter  (profiled {_n/_tot:.2f} it/s)", flush=True)
         train_s = time.perf_counter() - t0
         it_s = round(args.iters / train_s, 2)
 

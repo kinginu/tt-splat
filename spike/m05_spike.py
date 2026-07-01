@@ -24,8 +24,8 @@ from .model import GaussianModel
 from .render import ARMS
 
 # per-gaussian param count (SZ/RV add only global scalars, so same as A's 14)
-PARAMS_PER_GAUSSIAN = {"A": 14, "B": 14, "C0": 22, "C": 22, "SZ": 14, "RV": 14, "SM": 14, "BP": 14, "MO": 14, "E": 14, "D": 14}
-CANDIDATE_ARMS = ("A", "B", "C", "SZ", "RV", "SM", "BP", "MO", "E")   # real candidates (C0 = capacity control, D = ceiling)
+PARAMS_PER_GAUSSIAN = {"A": 14, "B": 14, "C0": 22, "C": 22, "SZ": 14, "RV": 14, "SM": 14, "BP": 14, "MO": 14, "PW": 14, "E": 14, "D": 14}
+CANDIDATE_ARMS = ("A", "B", "C", "SZ", "RV", "SM", "BP", "MO", "PW", "E")   # real candidates (C0 = capacity control, D = ceiling)
 
 
 def _spread(n_total, n):

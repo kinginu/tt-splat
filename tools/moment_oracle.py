@@ -118,5 +118,23 @@ for m in [4, 6]:
         print(f"  FAIL mboit m=4 mean error {err2.mean():.4f} > 0.05 (G=2 exact case)")
         all_ok = False
 
+# ── Section 4: arm PW — moment-free pairwise soft-compare on TRUE absorbance ─
+# PW skips the moment solve entirely: T = exp(-(a @ Sᵀ)) directly on the true per-(p,g)
+# absorbance a = -log1p(-alpha), no b=a@zp moment build, no w~=a/b0 recovery. Since S is the
+# same soft-compare used by recon="softcmp", and here it acts on the EXACT a (not a moment-
+# recovered surrogate), error should be >= as good as softcmp at every tau, -> 0 as tau -> 0.
+print("\n=== arm PW (moment-free pairwise soft-compare on true a), G=16 ===")
+for tau in [0.1, 0.03, 0.01]:
+    zw = arms._depth_warp(z)
+    S = torch.sigmoid((zw[:, None] - zw[None, :]) / tau)          # [G,G]
+    S = S * (1.0 - torch.eye(G, dtype=zw.dtype, device=zw.device))
+    logT = -(a @ S.T)
+    T_pw = torch.exp(logT.clamp(min=-30.0))
+    err = (T_pw - T_ref).abs()
+    print(f"  tau={tau}: mean_err={err.mean():.4f}  max_err={err.max():.4f}")
+    if tau == 0.01 and err.mean() > 0.05:
+        print(f"  FAIL PW tau=0.01 mean error {err.mean():.4f} > 0.05 (G=16)")
+        all_ok = False
+
 print("\nORACLE", "PASS" if all_ok else "FAIL")
 sys.exit(0 if all_ok else 1)

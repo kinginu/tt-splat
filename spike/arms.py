@@ -188,6 +188,35 @@ def blend_MO(w_geo, opacity_raw, depth, color, w_b, c_b, m=4, eps=1e-6,
     return num + T_bg * c_b[None, :]
 
 
+def blend_PW(w_geo, opacity_raw, depth, pw_tau, color, w_b, c_b, eps=1e-6):
+    """Moment-free per-pixel pairwise soft-occlusion (candidate #5, redux): MO-softcmp still runs
+    a moment solve (b = a@zp -> solve w~=a/b0) before the pairwise compare, which is redundant and
+    lossy -- the working core is just T ~= exp(-(a @ Sᵀ)) on the TRUE per-(p,g) absorbance `a`.
+    Skip the moment solve entirely and pairwise soft-compare `a` directly:
+
+        S[g,h] = sigmoid((zw_g - zw_h)/tau)   ("h in front of g", exclusive diagonal)
+        logT[p,g] = -sum_h a[p,h]*S[g,h] = -(a @ Sᵀ)[p,g]
+
+    Sort-free (S = [G,G] GEMM, no argsort/sort/cumsum); z ATTACHED through S (C3) so occlusion
+    produces a z-force. OIT-over composite (residual background transmittance), not WSR. One
+    learnable scalar tau>0 (same knob family as MO-softcmp's tau_softcmp; tau->0 = exact sorted
+    transmittance). Reuse MO's OIT-over composite, not `_wsr`."""
+    o = torch.sigmoid(opacity_raw)
+    alpha = (o[None, :] * w_geo).clamp(eps, 1.0 - 1e-4)          # [P,G]
+    a = -torch.log1p(-alpha)                                      # [P,G] true absorbance
+    zw = _depth_warp(depth)                                       # [G] in [0,1], ATTACHED (C3)
+    tau = pw_tau.clamp(min=1e-3)
+    G = zw.shape[0]
+    S = torch.sigmoid((zw[:, None] - zw[None, :]) / tau)          # [G,G]  S[g,h]=σ((z_g-z_h)/τ)
+    S = S * (1.0 - torch.eye(G, dtype=zw.dtype, device=zw.device))  # exclusive (zero self-compare)
+    logT = -(a @ S.transpose(-1, -2))                             # [P,G]  = -Σ_h a[p,h]·S[g,h]
+    T = torch.exp(logT.clamp(min=-30.0))                          # [P,G] transmittance
+    W = alpha * T                                                 # [P,G]
+    num = W @ color                                               # [P,3]
+    T_bg = torch.exp(-a.sum(dim=1, keepdim=True).clamp(min=0.0))  # [P,1] residual transmittance
+    return num + T_bg * c_b[None, :]
+
+
 def blend_C0(w_geo, opacity_sh, color, w_b, c_b):
     o = torch.sigmoid(sh.opacity_dc(opacity_sh))               # DC-only: no view dependence
     return _wsr(o[None, :] * w_geo, color, w_b, c_b)

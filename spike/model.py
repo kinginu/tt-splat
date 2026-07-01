@@ -51,6 +51,7 @@ class GaussianModel(nn.Module):
         self.softmin_tau = nn.Parameter(torch.tensor(2.0, dtype=dtype, device=device))  # arm SM temperature
         self.bp_tau = nn.Parameter(torch.tensor(2.0, dtype=dtype, device=device))   # arm BP temperature
         self.e_tau = nn.Parameter(torch.tensor(1.0, dtype=dtype, device=device))   # arm E soft surrogate temperature
+        self.pw_tau = nn.Parameter(torch.tensor(0.01, dtype=dtype, device=device))  # arm PW pairwise soft-compare temperature
         self.register_buffer("c_b", torch.ones(3, dtype=dtype, device=device))         # white bg
 
     @property
@@ -98,4 +99,5 @@ class GaussianModel(nn.Module):
             {"params": [self.softmin_tau], "lr": lr["depth"]},
             {"params": [self.bp_tau], "lr": lr["depth"]},
             {"params": [self.e_tau], "lr": lr["depth"]},
+            {"params": [self.pw_tau], "lr": lr["depth"]},
         ]

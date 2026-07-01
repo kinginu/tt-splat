@@ -32,14 +32,30 @@ def _spread(n_total, n):
     return max(1, n_total // max(1, n))
 
 
+def _binned_render_fn(K):
+    """Transparent override for train.fit/eval_psnr: arm PW renders via the device-faithful
+    K=128-per-tile binned torch render (spike/render_binned.py) instead of the dense O(P*G^2)
+    global-occlusion path; every other arm is untouched (dense `render`)."""
+    from .render_binned import render_binned
+
+    def render_fn(model, cam, arm, k=4.0, blur_eps=0.3, near=0.2, sh_degree=0):
+        if arm == "PW":
+            return render_binned(model, cam, K=K, k=k, blur_eps=blur_eps, near=near)
+        from .render import render
+        return render(model, cam, arm, k=k, blur_eps=blur_eps, near=near, sh_degree=sh_degree)
+
+    return render_fn
+
+
 def run_arm(arm, tr_cams, tr_imgs, ho_cams, ho_imgs, G, iters, seed, extent, lr=None, device="cpu",
-            sh_degree=0):
+            sh_degree=0, binned=0):
     model = GaussianModel(G, extent=extent, seed=seed, device=device)
+    render_fn = _binned_render_fn(binned) if binned else None
     t0 = time.time()
-    hist = train.fit(model, tr_cams, tr_imgs, arm, iters=iters, lr=lr, sh_degree=sh_degree)
+    hist = train.fit(model, tr_cams, tr_imgs, arm, iters=iters, lr=lr, sh_degree=sh_degree, render_fn=render_fn)
     dt = time.time() - t0
-    tr_psnr = train.eval_psnr(model, tr_cams, tr_imgs, arm, sh_degree=sh_degree)
-    ho_psnr = train.eval_psnr(model, ho_cams, ho_imgs, arm, sh_degree=sh_degree) if ho_cams else float("nan")
+    tr_psnr = train.eval_psnr(model, tr_cams, tr_imgs, arm, sh_degree=sh_degree, render_fn=render_fn)
+    ho_psnr = train.eval_psnr(model, ho_cams, ho_imgs, arm, sh_degree=sh_degree, render_fn=render_fn) if ho_cams else float("nan")
     return {"arm": arm, "G": G, "seed": seed, "train_psnr": tr_psnr, "holdout_psnr": ho_psnr,
             "final_loss": hist[-1], "params_per_g": PARAMS_PER_GAUSSIAN[arm], "secs": dt}
 
@@ -129,6 +145,10 @@ def main():
     ap.add_argument("--arms", default="A,B,C0,C,D")
     ap.add_argument("--sh-degree", type=int, default=0, help="view-dependent SH colour degree (0=DC)")
     ap.add_argument("--preflight", default="", help="comma G list for the arm-D floor check, e.g. 500,2000,8000")
+    ap.add_argument("--binned", type=int, default=0,
+                    help="K>0: render arm PW via the device-faithful K-per-tile binned torch "
+                         "render (spike/render_binned.py) instead of the dense O(P*G^2) global "
+                         "PW path; other arms unaffected. 0 (default) = dense path for all arms.")
     ap.add_argument("--device", default=None, help="cuda|cpu|cuda:0; default auto (CUDA if available)")
     ap.add_argument("--out", default="outputs/m05")
     args = ap.parse_args()
@@ -148,7 +168,8 @@ def main():
                                          n=args.n_holdout, stride=_spread(100, args.n_holdout))
     dev_name = torch.cuda.get_device_name(dev) if dev.type == "cuda" else f"cpu ({torch.get_num_threads()} threads)"
     print(f"loaded {len(tr_cams)} train + {len(ho_cams)} holdout @ {args.res}px | device={dev} [{dev_name}] | "
-          f"arms={arms} G={args.G} iters={args.iters} seeds={args.seeds}")
+          f"arms={arms} G={args.G} iters={args.iters} seeds={args.seeds}"
+          + (f" | binned K={args.binned} (arm PW)" if args.binned else ""))
 
     pre = []
     if args.preflight:
@@ -158,7 +179,7 @@ def main():
     rows = []
     for seed in range(args.seeds):
         for arm in arms:
-            r = run_arm(arm, tr_cams, tr_imgs, ho_cams, ho_imgs, args.G, args.iters, seed, args.extent, device=dev, sh_degree=args.sh_degree)
+            r = run_arm(arm, tr_cams, tr_imgs, ho_cams, ho_imgs, args.G, args.iters, seed, args.extent, device=dev, sh_degree=args.sh_degree, binned=args.binned)
             print(f"  [{arm:>2} seed{seed}] train {r['train_psnr']:.2f}  holdout {r['holdout_psnr']:.2f}  "
                   f"loss {r['final_loss']:.4f}  ({r['secs']:.0f}s)")
             rows.append(r)

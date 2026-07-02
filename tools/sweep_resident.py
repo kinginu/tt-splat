@@ -37,6 +37,8 @@ from geom_device import device_fwd_core, device_bwd_core, A, M
 from traced_fwd import gather_theta_buf
 from resident_traced import render_bwd, theta_bwd, T3, PN, B1, B2, EPS
 from loss_manual import gauss_1d, band_matrix, C1 as L_C1, C2 as L_C2, LAMBDA as L_LAM
+from bin_device import bin_to_buffers, build_inv_device, make_bin_ctx
+from m9_scatter_oracle import build_inv
 
 C0 = sh.C0
 DEV = None
@@ -125,6 +127,17 @@ def main():
     ap.add_argument("--random-bg", action="store_true")
     ap.add_argument("--colmap", default=None, help="path to a COLMAP scene root (real scene); overrides blender")
     ap.add_argument("--downscale", type=int, default=4, help="COLMAP image downscale factor")
+    # device-resident fast-path levers (opt-in; default off = current host behaviour). Ported from
+    # resident_traced.py, which already validated each against the host oracle.
+    ap.add_argument("--device-binning", action="store_true",
+                    help="compute binning idx/valid ON DEVICE (bin_to_buffers: v2 masked-dist+topk); "
+                         "removes the bin-every host sync + mu2d/keep download")
+    ap.add_argument("--device-scatter", action="store_true",
+                    help="run the bin->gaussian grad scatter ON DEVICE (traced gather-reduce over sinv_u); "
+                         "removes the per-iter rend-bwd sync + host index_add. arm-PW packs a 10th (gmcz_occ) channel")
+    ap.add_argument("--fused-adam", action="store_true",
+                    help="batch the 14 params into one [G,14] Adam update (~150 ops -> ~10); kills the "
+                         "untraced-Adam dispatch cost (was ~35-54%% of per-iter time)")
     args = ap.parse_args()
     assert sum([args.depth_weight, args.arm_softmin, args.arm_pairwise]) <= 1, \
         "--depth-weight, --arm-softmin, --arm-pairwise are mutually exclusive"
@@ -194,6 +207,9 @@ def main():
         mom = {k: u(torch.zeros(G)) for k in PN}; vom = {k: u(torch.zeros(G)) for k in PN}
         gacc = {k: u(torch.zeros(G)) for k in PN}
         tmp1 = {k: u(torch.zeros(G)) for k in PN}; tmp2 = {k: u(torch.zeros(G)) for k in PN}
+        # fused Adam: merged [G,14] moments + [1,14] per-param LR row (batch 14 params -> 1 update)
+        mom_m = u(torch.zeros(G, len(PN))); vom_m = u(torch.zeros(G, len(PN)))
+        LR_vec = u(torch.tensor([[LR[k] for k in PN]], dtype=torch.float32))   # [1,14], broadcast over G
         idx_u = ttnn.from_torch(torch.zeros(T, K, dtype=torch.int32), dtype=ttnn.uint32, layout=ttnn.ROW_MAJOR_LAYOUT, device=DEV)
         valid6 = u(torch.zeros(T, 6, K), BF); vf = u(torch.zeros(T, K, 1), BF)
         origins_t = u(tmap.origins[:, None, :].expand(T, K, 2).contiguous(), BF)
@@ -204,6 +220,18 @@ def main():
         gC_buf = u(torch.zeros(T, 256, 3), BF)
         gcon_buf = {k: u(torch.zeros(G)) for k in ("a", "b", "c", "mx", "my")}
         gco_buf = [u(torch.zeros(G)) for _ in range(3)]; gocl_buf = u(torch.zeros(G))
+        # device-scatter (bin->gaussian grad gather-reduce on device): inv[G,SMAX] slot table + zero
+        # sentinel row. arm-PW packs a 10th channel (gmcz_occ z-force); else 9 (a,b,c,mx,my,col0-2,op).
+        SMAX = (2 * 1 + 1) ** 2                                   # R=1 stencil -> <=9 valid slots per gaussian
+        NCH = 10 if args.arm_pairwise else 9
+        sinv_u = zrow = None
+        if args.device_scatter:
+            sinv_u = ttnn.from_torch(torch.full((G, SMAX), T * K, dtype=torch.int32),
+                                     dtype=ttnn.uint32, layout=ttnn.ROW_MAJOR_LAYOUT, device=DEV)
+            zrow = u(torch.zeros(1, NCH), BF)                    # grad_pad sentinel (gathered by inv padding)
+        # device-binning CONSTANTS preallocated ONCE (no per-bin-every from_torch -> trace/alloc safe).
+        # Shared by bin_to_buffers + build_inv_device (both only run in the --device-binning path).
+        bin_ctx = make_bin_ctx(tmap, G, K, DEV) if args.device_binning else None
         # depth-weight lever: rho=sigmoid(beta*(tau-z)), sort-free, multiplies o.
         # beta/tau are global learnable scalars (broadcast to [G,1] device buffers, host-Adam updated per-iter).
         beta_buf = u(torch.full((G,), args.beta0)); tau_buf = u(torch.full((G,), args.tau0))
@@ -448,6 +476,25 @@ def main():
 
         gct, gmt, gcol, goc, gmcz_occ_t = rend_bwd()
 
+        def scatter_dev():
+            """bin->gaussian grad scatter ON DEVICE: gather each gaussian's <=SMAX slot grads via the
+            sinv_u inv-table + sum. Replaces the host index_add round-trip -> no per-iter sync. Writes the
+            same geom-bwd grad buffers the host scatter did: (a,b,c,mx,my,col0,col1,col2,op) [+ gmcz_occ
+            for arm-PW]. Invalid slots are excluded by sinv_u (sentinel row -> zrow), so no vf mask needed."""
+            chans = [ttnn.typecast(gct, BF), ttnn.typecast(gmt, BF),
+                     ttnn.typecast(gcol, BF), ttnn.typecast(goc, BF)]
+            dests = [gcon_buf["a"], gcon_buf["b"], gcon_buf["c"], gcon_buf["mx"], gcon_buf["my"],
+                     gco_buf[0], gco_buf[1], gco_buf[2], gocl_buf]
+            if args.arm_pairwise:
+                chans.append(ttnn.typecast(gmcz_occ_t, BF))       # 10th channel: PW z-force
+                dests.append(gmcz_occ_buf)
+            gcat = ttnn.concat(chans, dim=-1)                     # [T,K,NCH]
+            gpad = ttnn.concat([ttnn.reshape(gcat, (T * K, NCH)), zrow], dim=0)   # [T*K+1,NCH]
+            g = ttnn.sum(ttnn.typecast(ttnn.embedding(sinv_u, gpad), DT), dim=1, keepdim=False)  # [G,NCH]
+            for c, b in zip(ttnn.split(g, 1, dim=1), dests):
+                ttnn.copy(c, b)
+            return g
+
         def geom_bwd():
             gg = device_bwd_core(cache, gcon_buf["a"], gcon_buf["b"], gcon_buf["c"], gcon_buf["mx"], gcon_buf["my"])
             sx, sy, sz = ttnn.exp(P["lx"]), ttnn.exp(P["ly"]), ttnn.exp(P["lz"])
@@ -516,6 +563,20 @@ def main():
                 ttnn.mul(mk, LR[k] / bc1, output_tensor=t2); ttnn.div(t2, t1, output_tensor=t2)
                 ttnn.subtract(p, t2, output_tensor=p)
 
+        def adam_fused(t):
+            """Batched Adam: concat the 14 grads -> [G,14], one update, split -> subtract into each P[k].
+            ~140 tiny ops -> ~10, killing the small-model dispatch bottleneck. Reads gout directly (no gacc)."""
+            bc1, bc2 = 1.0 - B1 ** t, 1.0 - B2 ** t
+            g = ttnn.concat([gout[k] for k in PN], dim=1)                              # [G,14]
+            ttnn.mul(mom_m, B1, output_tensor=mom_m)
+            ttnn.add(mom_m, ttnn.mul(g, 1.0 - B1), output_tensor=mom_m)                # m = B1 m + (1-B1) g
+            ttnn.mul(vom_m, B2, output_tensor=vom_m)
+            ttnn.add(vom_m, ttnn.mul(ttnn.mul(g, g), 1.0 - B2), output_tensor=vom_m)   # v = B2 v + (1-B2) g^2
+            denom = ttnn.add(ttnn.mul(ttnn.sqrt(vom_m), 1.0 / math.sqrt(bc2)), EPS)    # sqrt(v)/sqrt(bc2)+eps
+            step = ttnn.div(ttnn.mul(ttnn.mul(mom_m, LR_vec), 1.0 / bc1), denom)       # LR*m/bc1 / denom  [G,14]
+            for k, c in zip(PN, ttnn.split(step, 1, dim=1)):
+                ttnn.subtract(P[k], c, output_tensor=P[k])
+
         def adam_bt(t):
             """host-side Adam for the 2 global depth-weight scalars (grads reduced from [G] device buffers)."""
             bc1, bc2 = 1.0 - B1 ** t, 1.0 - B2 ** t
@@ -547,9 +608,13 @@ def main():
             pw_v["tau"] = B2 * pw_v["tau"] + (1 - B2) * g * g
             pw["tau"] -= args.lr_pwtau * (pw_m["tau"] / bc1) / (math.sqrt(pw_v["tau"] / bc2) + EPS)
             pw["tau"] = max(pw["tau"], 1e-3)             # clamp tau strictly positive
-            setbuf(pw_inv_tau_buf, torch.full((T, K, K), 1.0 / pw["tau"]), DT)
-            setbuf(pw_inv_tau_k1_buf, torch.full((T, K, 1), 1.0 / pw["tau"]), DT)
-            setbuf(pw_inv_tau2_buf, torch.full((T, 1, 1), 1.0 / (pw["tau"] ** 2)), DT)
+            # Update the full-replicate tau buffers by an IN-PLACE DEVICE scalar fill (mul-by-0 then
+            # add-scalar) instead of a host torch.full + copy_host_to_device. pw_inv_tau_buf is [T,K,K]
+            # (=67 MB fp32 at res512/K128) -> the host upload was ~40 ms/iter and dominated the Adam
+            # bucket; the device fill costs a couple ms and moves no data over PCIe.
+            inv_tau, inv_tau2 = 1.0 / pw["tau"], 1.0 / (pw["tau"] ** 2)
+            for buf, val in ((pw_inv_tau_buf, inv_tau), (pw_inv_tau_k1_buf, inv_tau), (pw_inv_tau2_buf, inv_tau2)):
+                ttnn.multiply(buf, 0.0, output_tensor=buf); ttnn.add(buf, val, output_tensor=buf)
 
         def _logit(p):
             return torch.log(p / (1.0 - p))
@@ -583,11 +648,41 @@ def main():
             for k in PN:
                 setbuf(P[k], vals[k], DT)
             touched = torch.unique(torch.cat([dead, uniq]))
-            for k in PN:                                       # reset Adam moments for touched slots
-                mk = dn(mom[k]).reshape(-1).clone(); vk = dn(vom[k]).reshape(-1).clone()
-                mk[touched] = 0.0; vk[touched] = 0.0
-                setbuf(mom[k], mk, DT); setbuf(vom[k], vk, DT)
+            if args.fused_adam:                                # fused Adam moments live in [G,14] merged buffers
+                for Mm in (mom_m, vom_m):
+                    mh = dn(Mm); mh[touched] = 0.0; setbuf(Mm, mh, DT)
+            else:
+                for k in PN:                                   # reset Adam moments for touched slots
+                    mk = dn(mom[k]).reshape(-1).clone(); vk = dn(vom[k]).reshape(-1).clone()
+                    mk[touched] = 0.0; vk[touched] = 0.0
+                    setbuf(mom[k], mk, DT); setbuf(vom[k], vk, DT)
             return int(dead.numel())
+
+        def set_sinv(idx, valid):
+            """HOST build_inv -> upload sinv_u (device-scatter path when binning stays on host)."""
+            setbuf(sinv_u, build_inv(idx, valid, G, SMAX).to(torch.int32), ttnn.uint32, ttnn.ROW_MAJOR_LAYOUT)
+
+        def do_bin():
+            """Fill idx_u/valid6/vf for this iter's binning (+ sinv_u for device-scatter).
+            --device-binning: bin ON DEVICE (bin_to_buffers) -> no host sync / no mu2d-keep download; with
+            --device-scatter also build the inv-table on device (build_inv_device) -> no idx download at all.
+            Else: host assign_bins + setbuf upload (original behaviour). Returns (idx,valid) host tensors,
+            or (None,None) when the host needs neither (device-binning + device-scatter)."""
+            if args.device_binning:
+                bin_to_buffers(cache["mu2d_x"], cache["mu2d_y"], cache["zmask"], tmap, 1, K, DEV,
+                               idx_u, valid6, vf, ctx=bin_ctx)
+                if args.device_scatter:
+                    build_inv_device(idx_u, ttnn.reshape(vf, (T, K)), cache["mu2d_x"], cache["mu2d_y"],
+                                     tmap, K, DEV, sinv_u=sinv_u, ctx=bin_ctx)
+                    return None, None
+                ttnn.synchronize_device(DEV)
+                idx = ttnn.to_torch(idx_u).long().reshape(T, K)
+                valid = ttnn.to_torch(vf).float().reshape(T, K) > 0.5
+            else:
+                idx, valid = assign_bins(dn(mu2d), dn(keep).reshape(-1) > 0.5, tmap, 1, K)
+                setbuf(idx_u, idx.to(torch.int32).reshape(T, K), ttnn.uint32, ttnn.ROW_MAJOR_LAYOUT)
+                setbuf(valid6, valid[:, None, :].expand(T, 6, K).float()); setbuf(vf, valid[..., None].float())
+            return idx, valid
 
         # ===== (B) warmup all traced fns (JIT) BEFORE capture, with view 0 =====
         setcam(tr_c, 0); ttnn.copy(gt_res[0], y_d)
@@ -606,11 +701,14 @@ def main():
             setbuf(zref_buf, torch.full((G,), zref_val), DT)
             print(f"[fast] arm-softmin ON: tau0={sm['tau']:.3f} zref={zref_val:.3f} lr_smtau={args.lr_smtau} "
                   f"(z range {float(zv.min()):.2f}-{float(zv.max()):.2f})", flush=True)
-        idx, valid = assign_bins(dn(mu2d), dn(keep).reshape(-1) > 0.5, tmap, 1, K)
-        setbuf(idx_u, idx.to(torch.int32).reshape(T, K), ttnn.uint32, ttnn.ROW_MAJOR_LAYOUT)
-        setbuf(valid6, valid[:, None, :].expand(T, 6, K).float()); setbuf(vf, valid[..., None].float())
+        idx, valid = do_bin()
+        if args.device_scatter and not args.device_binning:
+            set_sinv(idx, valid)                           # device-binning already built sinv_u on device
         C, rc, theta, col_t, oc_t = rend_fwd()
-        loss_grad_dev(); gct, gmt, gcol, goc, gmcz_occ_t = rend_bwd(); gout = geom_bwd()
+        loss_grad_dev(); gct, gmt, gcol, goc, gmcz_occ_t = rend_bwd()
+        if args.device_scatter:
+            scatter_dev()                                  # warmup: JIT concat/embedding/sum/split before capture
+        gout = geom_bwd()
         ttnn.synchronize_device(DEV)
 
         # ===== (C) capture traces =====
@@ -621,6 +719,9 @@ def main():
         rfid, (C, rc, theta, col_t, oc_t) = cap(rend_fwd)
         lfid, _ = cap(loss_grad_dev)
         rbid, (gct, gmt, gcol, goc, gmcz_occ_t) = cap(rend_bwd)
+        sbid = None
+        if args.device_scatter:
+            sbid, _ = cap(scatter_dev)
         gbid, gout = cap(geom_bwd)
         ttnn.synchronize_device(DEV)
 
@@ -676,36 +777,48 @@ def main():
             ttnn.execute_trace(DEV, gfid, cq_id=0, blocking=False)
             mark("geom_fwd")
             if it % args.bin_every == 0:
-                ttnn.synchronize_device(DEV)
-                idx, valid = assign_bins(dn(mu2d), dn(keep).reshape(-1) > 0.5, tmap, 1, K)
-                setbuf(idx_u, idx.to(torch.int32).reshape(T, K), ttnn.uint32, ttnn.ROW_MAJOR_LAYOUT)
-                setbuf(valid6, valid[:, None, :].expand(T, 6, K).float()); setbuf(vf, valid[..., None].float())
+                if not args.device_binning:
+                    ttnn.synchronize_device(DEV)           # host binning needs mu2d/keep back; device binning has no sync
+                idx, valid = do_bin()
+                if args.device_scatter and not args.device_binning:
+                    set_sinv(idx, valid)                   # device-binning already built sinv_u on device in do_bin
                 mark("bin")
             ttnn.execute_trace(DEV, rfid, cq_id=0, blocking=False)
             mark("rend_fwd")
             ttnn.execute_trace(DEV, lfid, cq_id=0, blocking=False)
             mark("loss")
-            ttnn.execute_trace(DEV, rbid, cq_id=0, blocking=False); ttnn.synchronize_device(DEV)
-            mark("rend_bwd")
-            flat = idx.reshape(-1); vfh = valid[..., None].float()
-            gconic = torch.zeros(G, 3).index_add_(0, flat, dn(gct).reshape(-1, 3))
-            gmu2d = torch.zeros(G, 2).index_add_(0, flat, dn(gmt).reshape(-1, 2))
-            gcolor_o = torch.zeros(G, 3).index_add_(0, flat, (dn(gcol) * vfh).reshape(-1, 3))
-            go_col = torch.zeros(G, 1).index_add_(0, flat, (dn(goc) * vfh).reshape(-1, 1))
-            setbuf(gcon_buf["a"], gconic[:, 0], DT); setbuf(gcon_buf["b"], gconic[:, 1], DT); setbuf(gcon_buf["c"], gconic[:, 2], DT)
-            setbuf(gcon_buf["mx"], gmu2d[:, 0], DT); setbuf(gcon_buf["my"], gmu2d[:, 1], DT)
-            for j in range(3):
-                setbuf(gco_buf[j], gcolor_o[:, j], DT)
-            setbuf(gocl_buf, go_col[:, 0], DT)
-            if args.arm_pairwise:
-                gmcz_occ = torch.zeros(G, 1).index_add_(0, flat, (dn(gmcz_occ_t) * vfh).reshape(-1, 1))
-                setbuf(gmcz_occ_buf, gmcz_occ[:, 0], DT)
-            mark("scatter")
+            if args.device_scatter:
+                # DEVICE scatter: rend-bwd -> device gather-reduce -> geom-bwd, all one cq, NO per-iter sync.
+                ttnn.execute_trace(DEV, rbid, cq_id=0, blocking=False)
+                mark("rend_bwd")
+                ttnn.execute_trace(DEV, sbid, cq_id=0, blocking=False)
+                mark("scatter")
+            else:
+                ttnn.execute_trace(DEV, rbid, cq_id=0, blocking=False); ttnn.synchronize_device(DEV)
+                mark("rend_bwd")
+                flat = idx.reshape(-1); vfh = valid[..., None].float()
+                gconic = torch.zeros(G, 3).index_add_(0, flat, dn(gct).reshape(-1, 3))
+                gmu2d = torch.zeros(G, 2).index_add_(0, flat, dn(gmt).reshape(-1, 2))
+                gcolor_o = torch.zeros(G, 3).index_add_(0, flat, (dn(gcol) * vfh).reshape(-1, 3))
+                go_col = torch.zeros(G, 1).index_add_(0, flat, (dn(goc) * vfh).reshape(-1, 1))
+                setbuf(gcon_buf["a"], gconic[:, 0], DT); setbuf(gcon_buf["b"], gconic[:, 1], DT); setbuf(gcon_buf["c"], gconic[:, 2], DT)
+                setbuf(gcon_buf["mx"], gmu2d[:, 0], DT); setbuf(gcon_buf["my"], gmu2d[:, 1], DT)
+                for j in range(3):
+                    setbuf(gco_buf[j], gcolor_o[:, j], DT)
+                setbuf(gocl_buf, go_col[:, 0], DT)
+                if args.arm_pairwise:
+                    gmcz_occ = torch.zeros(G, 1).index_add_(0, flat, (dn(gmcz_occ_t) * vfh).reshape(-1, 1))
+                    setbuf(gmcz_occ_buf, gmcz_occ[:, 0], DT)
+                mark("scatter")
             ttnn.execute_trace(DEV, gbid, cq_id=0, blocking=False)
-            for k in PN:
-                ttnn.copy(gout[k], gacc[k])
+            if not args.fused_adam:
+                for k in PN:
+                    ttnn.copy(gout[k], gacc[k])
             mark("geom_bwd")
-            adam_inplace(it + 1)
+            if args.fused_adam:
+                adam_fused(it + 1)                         # reads gout directly (no gout->gacc copies)
+            else:
+                adam_inplace(it + 1)
             if args.depth_weight:
                 adam_bt(it + 1)
             if args.arm_softmin:
@@ -720,7 +833,12 @@ def main():
                 adam_pw(it + 1)
             mark("adam")
             if args.relocate_every and it > 0 and it % args.relocate_every == 0:
-                relocate_host()
+                if PROF:
+                    _t_reloc = time.perf_counter()
+                    n_dead = relocate_host()
+                    print(f"   [relocate] it={it} dead={n_dead}/{G} took {time.perf_counter()-_t_reloc:.2f}s", flush=True)
+                else:
+                    relocate_host()
             if it % max(1, args.iters // 10) == 0:
                 ttnn.synchronize_device(DEV)
                 bt_s = f" | beta {bt['beta']:.3f} tau {bt['tau']:.3f}" if args.depth_weight else ""
@@ -771,20 +889,37 @@ def main():
         # Eval card (blender only — COLMAP has no per-pixel alpha for the two-bg trick)
         perc = {}
         if not args.colmap:
+            if PROF:
+                print("[diag] loading test rgba...", flush=True)
+                _t_lb = time.perf_counter()
             _, te_rgba = data.load_blender(args.scene, "test", res=res, keep_alpha=True)
+            if PROF:
+                print(f"[diag] loaded {len(te_rgba)} test rgba in {time.perf_counter()-_t_lb:.2f}s", flush=True)
+
+            _rfn_calls = [0]
 
             def rfn_eval(mdl, cam, b):
                 """Device render with constant bg b for evalcard two-bg perceptual metrics."""
+                if PROF:
+                    _rfn_calls[0] += 1
+                    if _rfn_calls[0] % 10 == 1:
+                        print(f"[diag] rfn_eval call #{_rfn_calls[0]}", flush=True)
                 setbuf(bias, torch.full((T, 256, 3), w_b * float(b)), BF)
                 _setcam_direct(cam)
                 ttnn.execute_trace(DEV, gfid, cq_id=0, blocking=False)
                 ttnn.synchronize_device(DEV)
+                if PROF and _rfn_calls[0] % 10 == 1:
+                    print(f"[diag]   gfid done", flush=True)
                 idx_e, valid_e = assign_bins(dn(mu2d), dn(keep).reshape(-1) > 0.5, tmap, 1, K)
+                if PROF and _rfn_calls[0] % 10 == 1:
+                    print(f"[diag]   assign_bins done", flush=True)
                 setbuf(idx_u, idx_e.to(torch.int32).reshape(T, K), ttnn.uint32, ttnn.ROW_MAJOR_LAYOUT)
                 setbuf(valid6, valid_e[:, None, :].expand(T, 6, K).float())
                 setbuf(vf, valid_e[..., None].float())
                 ttnn.execute_trace(DEV, rfid, cq_id=0, blocking=False)
                 ttnn.synchronize_device(DEV)
+                if PROF and _rfn_calls[0] % 10 == 1:
+                    print(f"[diag]   rfid done", flush=True)
                 return torch.zeros(H * W, 3).index_copy(0, tmap.gidx, dn(C).reshape(T * 256, 3)).reshape(H, W, 3)
 
             try:

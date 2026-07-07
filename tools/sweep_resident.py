@@ -89,6 +89,9 @@ def main():
     ap.add_argument("--K", type=int, default=128)
     ap.add_argument("--iters", type=int, default=3000)
     ap.add_argument("--bin-every", type=int, default=5)
+    ap.add_argument("--log-every", type=int, default=0,
+                    help="progress-print interval in iters (0 = auto = iters//10). Set small on long runs "
+                         "so the loop shows life before the first iters//10 milestone (~40 min at G=100k)")
     ap.add_argument("--n-train", type=int, default=100)
     ap.add_argument("--out", default="outputs/bh_sweep_fast")
     ap.add_argument("--method", default="bh_fast_resident",
@@ -634,17 +637,21 @@ def main():
                 return 0
             probs = o[alive] / o[alive].sum()
             targets = alive[torch.multinomial(probs, dead.numel(), replacement=True)]
+            # VECTORIZED: the old per-dead Python loop was O(dead * |GEOM_K|) scalar tensor writes and
+            # STALLED for ~1h at G=100k once the dead set grew large. Same math in ~15 tensor ops.
+            # dead ∩ targets = ∅ (targets ⊂ alive), so the gather/scatter below never aliases.
             uniq, counts = torch.unique(targets, return_counts=True)
-            n_at = {int(t): int(c) + 1 for t, c in zip(uniq.tolist(), counts.tolist())}
-            new_o = {int(t): float((o[int(t)] / n_at[int(t)]).clamp(1e-6, 1 - 1e-6)) for t in uniq.tolist()}
-            for t in uniq.tolist():
-                vals["op"][t] = _logit(torch.tensor(new_o[t]))
-            for d, t in zip(dead.tolist(), targets.tolist()):
-                for k in GEOM_K:
-                    vals[k][d] = vals[k][t]
-                vals["mx"][d] += 0.005 * float(torch.randn(())); vals["my"][d] += 0.005 * float(torch.randn(()))
-                vals["mz"][d] += 0.005 * float(torch.randn(()))
-                vals["op"][d] = _logit(torch.tensor(new_o[t]))
+            n_at = torch.ones(G)                               # receivers split by (count+1); others keep 1
+            n_at[uniq] = (counts + 1).float()
+            new_o = (o / n_at).clamp(1e-6, 1 - 1e-6)           # contribution-preserving split opacity [G]
+            for k in GEOM_K:                                   # copy each dead slot from its sampled target
+                vals[k][dead] = vals[k][targets]
+            nd = dead.numel()
+            vals["mx"][dead] += 0.005 * torch.randn(nd)
+            vals["my"][dead] += 0.005 * torch.randn(nd)
+            vals["mz"][dead] += 0.005 * torch.randn(nd)
+            vals["op"][uniq] = _logit(new_o[uniq])             # receivers get their reduced (split) opacity
+            vals["op"][dead] = _logit(new_o[targets])          # each dead slot inherits its target's split
             for k in PN:
                 setbuf(P[k], vals[k], DT)
             touched = torch.unique(torch.cat([dead, uniq]))
@@ -839,7 +846,7 @@ def main():
                     print(f"   [relocate] it={it} dead={n_dead}/{G} took {time.perf_counter()-_t_reloc:.2f}s", flush=True)
                 else:
                     relocate_host()
-            if it % max(1, args.iters // 10) == 0:
+            if it % (args.log_every or max(1, args.iters // 10)) == 0:
                 ttnn.synchronize_device(DEV)
                 bt_s = f" | beta {bt['beta']:.3f} tau {bt['tau']:.3f}" if args.depth_weight else ""
                 sm_s = f" | sm_tau {sm['tau']:.3f}" if args.arm_softmin else ""
